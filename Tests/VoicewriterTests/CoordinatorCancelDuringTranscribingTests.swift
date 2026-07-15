@@ -1,0 +1,123 @@
+import XCTest
+@testable import Voicewriter
+
+/// テスト用のフェイク`AudioCaptureEngineControlling`実装。実際の`AVAudioEngine`(実機オーディオ
+/// ハードウェア依存)を一切使わず、`Coordinator`が呼んだ操作の回数だけを記録する。
+private final class FakeAudioCaptureEngine: AudioCaptureEngineControlling {
+    weak var delegate: AudioCaptureEngineDelegate?
+    private(set) var startRecordingCallCount = 0
+    private(set) var stopRecordingCallCount = 0
+    private(set) var cancelRecordingCallCount = 0
+
+    func startRecording() { startRecordingCallCount += 1 }
+    func stopRecording() { stopRecordingCallCount += 1 }
+    func cancelRecording() { cancelRecordingCallCount += 1 }
+}
+
+/// テスト用のフェイク`TranscriptionEngine`。`transcribe(samples:sampleRate:)`の完了タイミングを
+/// テスト側から任意に制御できるようにし、「`await transcribe`実行中(=結果がまだ返っていない間)に
+/// キャンセルが要求される」状況を決定的に再現するために使う。
+private actor ControllableTranscriptionEngine: TranscriptionEngine {
+    private var resultContinuation: CheckedContinuation<String, Error>?
+    private var startedContinuation: CheckedContinuation<Void, Never>?
+    private var hasStarted = false
+
+    func transcribe(samples: [Float], sampleRate: Double) async throws -> String {
+        hasStarted = true
+        startedContinuation?.resume()
+        startedContinuation = nil
+        return try await withCheckedThrowingContinuation { continuation in
+            resultContinuation = continuation
+        }
+    }
+
+    /// `transcribe`が呼ばれ、内部のcontinuationで待機状態に入るまで待つ。
+    func waitUntilTranscribeStarted() async {
+        if hasStarted { return }
+        await withCheckedContinuation { continuation in
+            startedContinuation = continuation
+        }
+    }
+
+    /// 待機中の`transcribe`呼び出しを、指定したテキストで完了させる。
+    func resume(with text: String) {
+        resultContinuation?.resume(returning: text)
+        resultContinuation = nil
+    }
+}
+
+/// Codexレビュー指摘#1の回帰テスト:
+/// 修正前は`didFinishRecording`のハンドラが`discardPendingTranscriptionResult`を
+/// `await transcribe(...)`の**前**にローカル変数へ先読みしていたため、文字起こし実行中
+/// (=await中)にEscでキャンセルが要求されても、その時点で読んだ古い(false)値のまま判定してしまい、
+/// キャンセルが無視されて結果が挿入されてしまっていた。
+///
+/// 実際の`AVAudioEngine`はハードウェア依存で単体テストが難しいため、`AudioCaptureEngineControlling`
+/// プロトコルのフェイク実装(`FakeAudioCaptureEngine`)と、完了タイミングを制御できる
+/// `TranscriptionEngine`のフェイク実装(`ControllableTranscriptionEngine`)を使い、
+/// 「transcribe()が完了する前にcancelRecording()が呼ばれる」状況を決定的に再現する。
+@MainActor
+final class CoordinatorCancelDuringTranscribingTests: XCTestCase {
+    func testCancelRequestedWhileTranscribeIsAwaitingIsNotIgnored() async {
+        let audioEngine = FakeAudioCaptureEngine()
+        let transcriptionEngine = ControllableTranscriptionEngine()
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine)
+
+        var insertedResults: [String] = []
+        coordinator.onTranscriptionResult = { text, _ in insertedResults.append(text) }
+
+        coordinator.beginPushToTalk()
+        coordinator.endPushToTalk()
+        XCTAssertEqual(coordinator.state, .transcribing)
+
+        // AudioCaptureEngineからの「録音終了、文字起こし開始」通知をシミュレートする。
+        coordinator.audioCaptureEngine(audioEngine, didFinishRecording: [0.0, 0.0], sampleRate: 16000)
+
+        // `transcribe()`がcontinuationで待機状態に入るまで、MainActor上の他のTaskに実行を譲る。
+        await transcriptionEngine.waitUntilTranscribeStarted()
+
+        // ここが本質: 文字起こし実行中(= transcribe()がまだ結果を返す前)にキャンセル(Esc)が
+        // 要求された状況を再現する。修正前はこの時点のフラグが先読みされてしまい無視されていた。
+        XCTAssertEqual(coordinator.state, .transcribing)
+        coordinator.cancelRecording()
+
+        // 文字起こしを完了させる。
+        await transcriptionEngine.resume(with: "こんにちは")
+
+        // 結果反映のTaskがMainActor上で完了し、状態がidleに戻るまで待つ。
+        for _ in 0..<200 where coordinator.state != .idle {
+            await Task.yield()
+        }
+
+        XCTAssertEqual(coordinator.state, .idle)
+        XCTAssertTrue(
+            insertedResults.isEmpty,
+            "await transcribe実行中にキャンセルされた場合、結果は挿入されず破棄されるべき"
+        )
+    }
+
+    /// 対照実験: キャンセルされなかった場合は、通常通り結果が挿入されることを確認する
+    /// (上のテストが「常に破棄される」ように壊れていないことの確認)。
+    func testResultIsInsertedWhenNotCancelled() async {
+        let audioEngine = FakeAudioCaptureEngine()
+        let transcriptionEngine = ControllableTranscriptionEngine()
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine)
+
+        var insertedResults: [String] = []
+        coordinator.onTranscriptionResult = { text, _ in insertedResults.append(text) }
+
+        coordinator.beginPushToTalk()
+        coordinator.endPushToTalk()
+        coordinator.audioCaptureEngine(audioEngine, didFinishRecording: [0.0, 0.0], sampleRate: 16000)
+
+        await transcriptionEngine.waitUntilTranscribeStarted()
+        await transcriptionEngine.resume(with: "こんにちは")
+
+        for _ in 0..<200 where coordinator.state != .idle {
+            await Task.yield()
+        }
+
+        XCTAssertEqual(coordinator.state, .idle)
+        XCTAssertEqual(insertedResults, ["こんにちは"])
+    }
+}
