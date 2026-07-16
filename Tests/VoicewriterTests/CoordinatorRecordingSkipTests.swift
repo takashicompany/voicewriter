@@ -21,15 +21,26 @@ private final class FakeClock {
     }
 }
 
-/// `transcribe(samples:sampleRate:)`が実際に呼ばれたかどうかを記録するフェイク。
+/// テスト用のフェイク`TextInserting`。即座に挿入完了とみなす。
+private final class FakeTextInserter: TextInserting {
+    private(set) var insertedTexts: [String] = []
+    func insert(text: String, expectedFrontmostProcessIdentifier: pid_t?, onPasted: @escaping () -> Void) async throws {
+        insertedTexts.append(text)
+        onPasted()
+    }
+}
+
+/// `transcribe(...)`が実際に呼ばれたかどうかを記録するフェイク。
 /// ハルシネーション対策の第1層/第2層は「whisper_full自体を呼ばない」ことが要件のため、
 /// 呼び出し回数そのものを検証する。
 private final class RecordingCountingTranscriptionEngine: TranscriptionEngine {
     private(set) var callCount = 0
+    private(set) var lastVadEnabled: Bool?
     let text: String
     init(text: String = "こんにちは") { self.text = text }
-    func transcribe(samples: [Float], sampleRate: Double) async throws -> String {
+    func transcribe(samples: [Float], sampleRate: Double, language: String, vocabularyHint: String, vadEnabled: Bool) async throws -> String {
         callCount += 1
+        lastVadEnabled = vadEnabled
         return text
     }
 }
@@ -50,14 +61,13 @@ final class CoordinatorRecordingSkipTests: XCTestCase {
         let transcriptionEngine = RecordingCountingTranscriptionEngine()
         // 押下から離すまでを0.1秒(閾値0.3秒未満)としてシミュレートする。
         let clock = FakeClock(step: 0.1)
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, now: clock.now)
+        let textInserter = FakeTextInserter()
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textInserter: textInserter, now: clock.now)
 
-        var insertedResults: [String] = []
-        coordinator.onTranscriptionResult = { text, _ in insertedResults.append(text) }
-        var skippedReasons: [RecordingSkipReason] = []
-        coordinator.onRecordingSkipped = { skippedReasons.append($0) }
+        var committed: [DictationJobCommitEvent] = []
+        coordinator.onJobCommitted = { _, result in committed.append(result) }
 
-        coordinator.beginPushToTalk()
+        await coordinator.beginPushToTalk()
         coordinator.endPushToTalk()
         coordinator.audioCaptureEngine(audioEngine, didFinishRecording: sufficientEnergySamples, sampleRate: 16000)
 
@@ -67,8 +77,9 @@ final class CoordinatorRecordingSkipTests: XCTestCase {
 
         XCTAssertEqual(coordinator.state, .idle)
         XCTAssertEqual(transcriptionEngine.callCount, 0, "閾値未満の録音はwhisper_full(transcribe)自体を呼ばないべき")
-        XCTAssertTrue(insertedResults.isEmpty, "短すぎる録音は挿入されないべき")
-        XCTAssertEqual(skippedReasons, [.tooShort])
+        XCTAssertTrue(textInserter.insertedTexts.isEmpty, "短すぎる録音は挿入されないべき")
+        XCTAssertEqual(committed.count, 1)
+        XCTAssertEqual(committed.first.flatMap(Self.skipReason), .tooShort)
     }
 
     func testSufficientlyLongButSilentRecordingSkipsTranscriptionEntirely() async {
@@ -76,14 +87,13 @@ final class CoordinatorRecordingSkipTests: XCTestCase {
         let transcriptionEngine = RecordingCountingTranscriptionEngine()
         // 押下から離すまでを1秒(閾値は十分満たす)としてシミュレートする。
         let clock = FakeClock(step: 1.0)
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, now: clock.now)
+        let textInserter = FakeTextInserter()
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textInserter: textInserter, now: clock.now)
 
-        var insertedResults: [String] = []
-        coordinator.onTranscriptionResult = { text, _ in insertedResults.append(text) }
-        var skippedReasons: [RecordingSkipReason] = []
-        coordinator.onRecordingSkipped = { skippedReasons.append($0) }
+        var committed: [DictationJobCommitEvent] = []
+        coordinator.onJobCommitted = { _, result in committed.append(result) }
 
-        coordinator.beginPushToTalk()
+        await coordinator.beginPushToTalk()
         coordinator.endPushToTalk()
         coordinator.audioCaptureEngine(audioEngine, didFinishRecording: silentSamples, sampleRate: 16000)
 
@@ -93,22 +103,22 @@ final class CoordinatorRecordingSkipTests: XCTestCase {
 
         XCTAssertEqual(coordinator.state, .idle)
         XCTAssertEqual(transcriptionEngine.callCount, 0, "無音の録音はwhisper_full(transcribe)自体を呼ばないべき")
-        XCTAssertTrue(insertedResults.isEmpty, "無音の録音は挿入されないべき")
-        XCTAssertEqual(skippedReasons, [.silence])
+        XCTAssertTrue(textInserter.insertedTexts.isEmpty, "無音の録音は挿入されないべき")
+        XCTAssertEqual(committed.count, 1)
+        XCTAssertEqual(committed.first.flatMap(Self.skipReason), .silence)
     }
 
     func testLongEnoughAndLoudRecordingIsTranscribedNormally() async {
         let audioEngine = FakeAudioCaptureEngine()
         let transcriptionEngine = RecordingCountingTranscriptionEngine(text: "こんにちは、今日は良い天気ですね")
         let clock = FakeClock(step: 1.0)
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, now: clock.now)
+        let textInserter = FakeTextInserter()
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textInserter: textInserter, now: clock.now)
 
-        var insertedResults: [String] = []
-        coordinator.onTranscriptionResult = { text, _ in insertedResults.append(text) }
-        var skippedReasons: [RecordingSkipReason] = []
-        coordinator.onRecordingSkipped = { skippedReasons.append($0) }
+        var committed: [DictationJobCommitEvent] = []
+        coordinator.onJobCommitted = { _, result in committed.append(result) }
 
-        coordinator.beginPushToTalk()
+        await coordinator.beginPushToTalk()
         coordinator.endPushToTalk()
         coordinator.audioCaptureEngine(audioEngine, didFinishRecording: sufficientEnergySamples, sampleRate: 16000)
 
@@ -118,24 +128,24 @@ final class CoordinatorRecordingSkipTests: XCTestCase {
 
         XCTAssertEqual(coordinator.state, .idle)
         XCTAssertEqual(transcriptionEngine.callCount, 1, "通常の録音はtranscribeが呼ばれるべき")
-        XCTAssertEqual(insertedResults, ["こんにちは、今日は良い天気ですね"])
-        XCTAssertTrue(skippedReasons.isEmpty)
+        XCTAssertEqual(textInserter.insertedTexts, ["こんにちは、今日は良い天気ですね"])
+        XCTAssertEqual(committed.count, 1)
+        XCTAssertNil(committed.first.flatMap(Self.skipReason))
     }
 
     /// 第5層: whisper.cppの出力が既知のハルシネーション定型句のみだった場合、
-    /// テキスト挿入もLLM整形も行わず`onRecordingSkipped(.silence)`が呼ばれるべき。
+    /// テキスト挿入もLLM整形も行わず`.skipped(.silence)`としてコミットされるべき。
     func testOutputThatIsOnlyAKnownHallucinationPhraseIsDiscarded() async {
         let audioEngine = FakeAudioCaptureEngine()
         let transcriptionEngine = RecordingCountingTranscriptionEngine(text: "ご視聴ありがとうございました。")
         let clock = FakeClock(step: 1.0)
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, now: clock.now)
+        let textInserter = FakeTextInserter()
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textInserter: textInserter, now: clock.now)
 
-        var insertedResults: [String] = []
-        coordinator.onTranscriptionResult = { text, _ in insertedResults.append(text) }
-        var skippedReasons: [RecordingSkipReason] = []
-        coordinator.onRecordingSkipped = { skippedReasons.append($0) }
+        var committed: [DictationJobCommitEvent] = []
+        coordinator.onJobCommitted = { _, result in committed.append(result) }
 
-        coordinator.beginPushToTalk()
+        await coordinator.beginPushToTalk()
         coordinator.endPushToTalk()
         coordinator.audioCaptureEngine(audioEngine, didFinishRecording: sufficientEnergySamples, sampleRate: 16000)
 
@@ -145,8 +155,9 @@ final class CoordinatorRecordingSkipTests: XCTestCase {
 
         XCTAssertEqual(coordinator.state, .idle)
         XCTAssertEqual(transcriptionEngine.callCount, 1, "第5層はtranscribe後の出力に対するフィルタなので、transcribe自体は呼ばれる")
-        XCTAssertTrue(insertedResults.isEmpty, "既知の定型句のみの出力は挿入されないべき")
-        XCTAssertEqual(skippedReasons, [.silence])
+        XCTAssertTrue(textInserter.insertedTexts.isEmpty, "既知の定型句のみの出力は挿入されないべき")
+        XCTAssertEqual(committed.count, 1)
+        XCTAssertEqual(committed.first.flatMap(Self.skipReason), .silence)
     }
 
     /// 混在ケース: ハルシネーション定型句が実発話の一部として含まれていても、
@@ -156,14 +167,13 @@ final class CoordinatorRecordingSkipTests: XCTestCase {
         let realSpeechWithPhrase = "今日の会議の内容を共有します。ご視聴ありがとうございました。"
         let transcriptionEngine = RecordingCountingTranscriptionEngine(text: realSpeechWithPhrase)
         let clock = FakeClock(step: 1.0)
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, now: clock.now)
+        let textInserter = FakeTextInserter()
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textInserter: textInserter, now: clock.now)
 
-        var insertedResults: [String] = []
-        coordinator.onTranscriptionResult = { text, _ in insertedResults.append(text) }
-        var skippedReasons: [RecordingSkipReason] = []
-        coordinator.onRecordingSkipped = { skippedReasons.append($0) }
+        var committed: [DictationJobCommitEvent] = []
+        coordinator.onJobCommitted = { _, result in committed.append(result) }
 
-        coordinator.beginPushToTalk()
+        await coordinator.beginPushToTalk()
         coordinator.endPushToTalk()
         coordinator.audioCaptureEngine(audioEngine, didFinishRecording: sufficientEnergySamples, sampleRate: 16000)
 
@@ -172,7 +182,40 @@ final class CoordinatorRecordingSkipTests: XCTestCase {
         }
 
         XCTAssertEqual(coordinator.state, .idle)
-        XCTAssertEqual(insertedResults, [realSpeechWithPhrase], "定型句が実発話の一部に含まれるだけの場合は挿入されるべき")
-        XCTAssertTrue(skippedReasons.isEmpty)
+        XCTAssertEqual(textInserter.insertedTexts, [realSpeechWithPhrase], "定型句が実発話の一部に含まれるだけの場合は挿入されるべき")
+        XCTAssertEqual(committed.count, 1)
+        XCTAssertNil(committed.first.flatMap(Self.skipReason))
+    }
+
+    private static func skipReason(_ event: DictationJobCommitEvent) -> RecordingSkipReason? {
+        if case .skipped(let reason) = event { return reason }
+        return nil
+    }
+
+    /// Codexレビュー指摘#8の回帰テスト: VAD有効/無効はジョブの録音時点の設定スナップショットに
+    /// 含まれ、待ち行列中に設定画面から変更されても、既に録音済みのジョブには影響しないべき
+    /// (以前は`WhisperCppEngine`が実行時に毎回`Settings.vadEnabled`を直接読んでいた)。
+    func testVadEnabledSnapshotIsCapturedAtRecordingStartAndNotAffectedByLaterSettingChange() async {
+        let originalVadEnabled = Settings.vadEnabled
+        Settings.vadEnabled = true
+        defer { Settings.vadEnabled = originalVadEnabled }
+
+        let audioEngine = FakeAudioCaptureEngine()
+        let transcriptionEngine = RecordingCountingTranscriptionEngine()
+        let clock = FakeClock(step: 1.0)
+        let textInserter = FakeTextInserter()
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textInserter: textInserter, now: clock.now)
+
+        await coordinator.beginPushToTalk()
+        // 録音中に設定を変更する(待ち行列中の設定変更を模す)。
+        Settings.vadEnabled = false
+        coordinator.endPushToTalk()
+        coordinator.audioCaptureEngine(audioEngine, didFinishRecording: sufficientEnergySamples, sampleRate: 16000)
+
+        for _ in 0..<200 where coordinator.state != .idle {
+            await Task.yield()
+        }
+
+        XCTAssertEqual(transcriptionEngine.lastVadEnabled, true, "録音開始時点(true)のVAD設定スナップショットが使われるべき")
     }
 }

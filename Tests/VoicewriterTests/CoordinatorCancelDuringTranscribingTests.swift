@@ -29,11 +29,20 @@ private final class FakeClock {
     }
 }
 
+/// テスト用のフェイク`TextInserting`。即座に挿入完了とみなす。
+private final class FakeTextInserter: TextInserting {
+    private(set) var insertedTexts: [String] = []
+    func insert(text: String, expectedFrontmostProcessIdentifier: pid_t?, onPasted: @escaping () -> Void) async throws {
+        insertedTexts.append(text)
+        onPasted()
+    }
+}
+
 /// ハルシネーション対策の第2層(エネルギーゲート)を通過させるためのダミー音声サンプル
 /// (無音ではなく、発話とみなせる程度の振幅を持つ)。
 private let nonSilentDummySamples: [Float] = Array(repeating: Float(0.3), count: 4800)
 
-/// テスト用のフェイク`TranscriptionEngine`。`transcribe(samples:sampleRate:)`の完了タイミングを
+/// テスト用のフェイク`TranscriptionEngine`。`transcribe(...)`の完了タイミングを
 /// テスト側から任意に制御できるようにし、「`await transcribe`実行中(=結果がまだ返っていない間)に
 /// キャンセルが要求される」状況を決定的に再現するために使う。
 private actor ControllableTranscriptionEngine: TranscriptionEngine {
@@ -41,7 +50,7 @@ private actor ControllableTranscriptionEngine: TranscriptionEngine {
     private var startedContinuation: CheckedContinuation<Void, Never>?
     private var hasStarted = false
 
-    func transcribe(samples: [Float], sampleRate: Double) async throws -> String {
+    func transcribe(samples: [Float], sampleRate: Double, language: String, vocabularyHint: String, vadEnabled: Bool) async throws -> String {
         hasStarted = true
         startedContinuation?.resume()
         startedContinuation = nil
@@ -71,22 +80,21 @@ private actor ControllableTranscriptionEngine: TranscriptionEngine {
 /// (=await中)にEscでキャンセルが要求されても、その時点で読んだ古い(false)値のまま判定してしまい、
 /// キャンセルが無視されて結果が挿入されてしまっていた。
 ///
-/// 実際の`AVAudioEngine`はハードウェア依存で単体テストが難しいため、`AudioCaptureEngineControlling`
-/// プロトコルのフェイク実装(`FakeAudioCaptureEngine`)と、完了タイミングを制御できる
-/// `TranscriptionEngine`のフェイク実装(`ControllableTranscriptionEngine`)を使い、
-/// 「transcribe()が完了する前にcancelRecording()が呼ばれる」状況を決定的に再現する。
+/// 連続音声入力パイプライン化後は、この「先読みしない」制約は`DictationJobRegistry.isCancelled`を
+/// 各ステージ実行前に都度読むことで担保している。
 @MainActor
 final class CoordinatorCancelDuringTranscribingTests: XCTestCase {
     func testCancelRequestedWhileTranscribeIsAwaitingIsNotIgnored() async {
         let audioEngine = FakeAudioCaptureEngine()
         let transcriptionEngine = ControllableTranscriptionEngine()
         let clock = FakeClock()
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, now: clock.now)
+        let textInserter = FakeTextInserter()
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textInserter: textInserter, now: clock.now)
 
-        var insertedResults: [String] = []
-        coordinator.onTranscriptionResult = { text, _ in insertedResults.append(text) }
+        var committed: [DictationJobCommitEvent] = []
+        coordinator.onJobCommitted = { _, result in committed.append(result) }
 
-        coordinator.beginPushToTalk()
+        await coordinator.beginPushToTalk()
         coordinator.endPushToTalk()
         XCTAssertEqual(coordinator.state, .transcribing)
 
@@ -96,8 +104,8 @@ final class CoordinatorCancelDuringTranscribingTests: XCTestCase {
         // `transcribe()`がcontinuationで待機状態に入るまで、MainActor上の他のTaskに実行を譲る。
         await transcriptionEngine.waitUntilTranscribeStarted()
 
-        // ここが本質: 文字起こし実行中(= transcribe()がまだ結果を返す前)にキャンセル(Esc)が
-        // 要求された状況を再現する。修正前はこの時点のフラグが先読みされてしまい無視されていた。
+        // ここが本質: 文字起こし実行中(= transcribe()がまだ結果を返す前)にキャンセル(Esc、非録音時の
+        // 階層(2): 最新の未挿入ジョブをキャンセル)が要求された状況を再現する。
         XCTAssertEqual(coordinator.state, .transcribing)
         coordinator.cancelRecording()
 
@@ -110,10 +118,13 @@ final class CoordinatorCancelDuringTranscribingTests: XCTestCase {
         }
 
         XCTAssertEqual(coordinator.state, .idle)
-        XCTAssertTrue(
-            insertedResults.isEmpty,
-            "await transcribe実行中にキャンセルされた場合、結果は挿入されず破棄されるべき"
-        )
+        XCTAssertTrue(textInserter.insertedTexts.isEmpty, "await transcribe実行中にキャンセルされた場合、結果は挿入されず破棄されるべき")
+        XCTAssertEqual(committed.count, 1)
+        if case .cancelled = committed.first {
+            // expected
+        } else {
+            XCTFail("Expected .cancelled, got \(String(describing: committed.first))")
+        }
     }
 
     /// 対照実験: キャンセルされなかった場合は、通常通り結果が挿入されることを確認する
@@ -122,12 +133,13 @@ final class CoordinatorCancelDuringTranscribingTests: XCTestCase {
         let audioEngine = FakeAudioCaptureEngine()
         let transcriptionEngine = ControllableTranscriptionEngine()
         let clock = FakeClock()
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, now: clock.now)
+        let textInserter = FakeTextInserter()
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textInserter: textInserter, now: clock.now)
 
-        var insertedResults: [String] = []
-        coordinator.onTranscriptionResult = { text, _ in insertedResults.append(text) }
+        var committed: [DictationJobCommitEvent] = []
+        coordinator.onJobCommitted = { _, result in committed.append(result) }
 
-        coordinator.beginPushToTalk()
+        await coordinator.beginPushToTalk()
         coordinator.endPushToTalk()
         coordinator.audioCaptureEngine(audioEngine, didFinishRecording: nonSilentDummySamples, sampleRate: 16000)
 
@@ -139,6 +151,12 @@ final class CoordinatorCancelDuringTranscribingTests: XCTestCase {
         }
 
         XCTAssertEqual(coordinator.state, .idle)
-        XCTAssertEqual(insertedResults, ["こんにちは"])
+        XCTAssertEqual(textInserter.insertedTexts, ["こんにちは"])
+        XCTAssertEqual(committed.count, 1)
+        if case .inserted(let text, _) = committed.first {
+            XCTAssertEqual(text, "こんにちは")
+        } else {
+            XCTFail("Expected .inserted, got \(String(describing: committed.first))")
+        }
     }
 }

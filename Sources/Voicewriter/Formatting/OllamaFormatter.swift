@@ -39,17 +39,15 @@ final class OllamaFormatter: TextFormatter, @unchecked Sendable {
         self.session = URLSession(configuration: .ephemeral)
     }
 
-    func format(text: String, vocabularyHint: String) async throws -> String {
+    func format(text: String, vocabularyHint: String, model: String, timeoutSeconds: TimeInterval) async throws -> String {
         let trimmedInput = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedInput.isEmpty else {
             throw TextFormatterError.emptyInput
         }
 
-        // モデル/タイムアウトは呼び出しごとに`Settings`から読む(WhisperCppEngineが
-        // `sttVocabularyHint`を呼び出しごとに読むのと同じ方針)。設定画面からの変更を
-        // 再起動・再生成なしで次回の整形から反映するため。
-        let model = Settings.formattingModel
-        let timeoutSeconds = Settings.formattingTimeoutSeconds
+        // タイムアウト・モデル名はいずれも呼び出し元(ジョブの録音時点の設定スナップショット)から
+        // 渡されたものをそのまま使う(待ち行列中の設定変更の影響を受けないようにするため。
+        // Codexレビュー指摘#8: 以前はタイムアウトのみ`Settings`から直接読んでいた)。
 
         let requestBody: [String: Any] = [
             "model": model,

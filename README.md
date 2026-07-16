@@ -2,6 +2,8 @@
 
 macOSメニューバー常駐の音声入力アプリです。STTはwhisper.cpp(ggml-large-v3-turbo, Metal有効)をデフォルトエンジンとして使い、モデルが未配置の場合はスタブ実装(録音したPCMをWAVとして保存し、ダミーテキストを返す)にフォールバックします。文字起こし結果はAmical方式(クリップボード経由+Cmd+V合成)でカーソル位置に自動挿入されます。
 
+前の発話の認識・整形が完了していなくても、ホットキーで次の録音を即座に開始できる**連続音声入力パイプライン**に対応しています(詳細は「連続音声入力パイプライン」セクション参照)。複数の発話が同時に処理系に存在しうる状況でも、テキストの挿入は必ず**発話順(録音を開始した順)**で行われます。
+
 ## 必要環境
 
 - macOS 14 (Sonoma) 以上 (Apple Silicon / Intel)
@@ -221,20 +223,24 @@ tccutil reset Microphone dev.voicewriter.app
 
 ## 状態表示HUDと効果音
 
-superwhisper/Wispr Flow風の、画面下部中央に浮かぶ小さなピル型パネルで録音・認識・整形・挿入の状態を表示します(`Sources/Voicewriter/HUD/`)。`Coordinator`/`AudioCaptureEngine`/`TextInserter`の既存コールバック・状態変更点に配線を追加しただけで、状態機械のロジック自体には手を入れていません。
+superwhisper/Wispr Flow風の、画面下部中央に浮かぶ小さなピル型パネルで録音・認識・整形・挿入の状態を表示します(`Sources/Voicewriter/HUD/`)。`Coordinator`/`AudioCaptureEngine`/`DeliveryCoordinator`の既存コールバック・状態変更点に配線を追加しただけで、状態機械のロジック自体には手を入れていません。
+
+連続音声入力パイプライン対応として、個々のジョブイベントを直接表示するのではなく、`StatusHUDController`が「録音状態」「未終端ジョブ数(残件数)」「現在アクティブなフェーズ」を集約したスナップショットから表示を導出します。表示優先度は**録音中 > 処理フェーズ > 完了通知**であり、**録音中のレベルメーター表示を、他ジョブの完了通知が上書きすることはありません**(バックグラウンドで別ジョブが完了しても、今まさに話している録音表示を邪魔しない)。
 
 ### 表示内容
 
 | 状態 | 表示 |
 |---|---|
-| 録音中 | マイクアイコン + 5本バーの簡易音声レベルメーター(RMS、`AudioCaptureEngine.onLevelUpdate`から購読) + 「録音中」 |
-| 認識中 | スピナー + 「認識中…」 |
+| 録音中 | マイクアイコン + 5本バーの簡易音声レベルメーター(RMS、`AudioCaptureEngine.onLevelUpdate`から購読) + 「録音中」(他に処理中/待機中のジョブがあれば「録音中 +2件処理中」のように残件数を付記) |
+| 認識中 | スピナー + 「認識中…」(残件数があれば「認識中… 残り2件」) |
 | 整形中 | スピナー + 「整形中…」(`Coordinator.onPhaseChanged`で内部フェーズを通知。`AppState`自体はこの間ずっと`.transcribing`のまま) |
 | 挿入完了 | チェックマーク + 「挿入しました」を0.8秒表示してフェードアウト |
 | フォールバック挿入 | 警告アイコン + 「整形なしで挿入」を1.5秒表示してフェードアウト(LLM整形が失敗し原文へフォールバックした場合) |
+| スキップ/キャンセル/失敗/フォーカス不一致 | 「短すぎるためキャンセル」「無音のためキャンセル」「キャンセルしました」「文字起こしに失敗しました」「挿入先変更のため中止」等を1.0〜1.5秒表示してフェードアウト |
+| キュー上限到達 | オレンジのトレイアイコン + 「処理が追いついていません」(通常のビープと区別できる表示) |
 | idle | 完全に非表示(パネルを`orderOut`) |
 
-表示/非表示は0.15秒のフェードアニメーション。ダーク寄りの半透明マテリアル(`.ultraThinMaterial`)・角丸ピル型・幅約208pxのコンパクトなパネル。
+表示/非表示は0.15秒のフェードアニメーション。ダーク寄りの半透明マテリアル(`.ultraThinMaterial`)・角丸ピル型・幅約224pxのコンパクトなパネル。
 
 ### フォーカスを奪わない実装(`StatusHUDPanel`)
 
@@ -250,7 +256,7 @@ superwhisper/Wispr Flow風の、画面下部中央に浮かぶ小さなピル型
 
 ### 効果音(`Sources/Voicewriter/Support/SoundEffects.swift`)
 
-録音開始時に`NSSound(named: "Tink")`、テキスト挿入完了時(`TextInserter.onPasted`、実際にCmd+Vを送出した直後)に`NSSound(named: "Pop")`を鳴らします。独自音源は追加せず、macOS標準のシステムサウンドのみを使用します。
+録音開始時に`NSSound(named: "Tink")`、テキスト挿入完了時(`insert(text:onPasted:)`のコール単位`onPasted`引数、実際にCmd+Vを送出した直後)に`NSSound(named: "Pop")`を鳴らします。独自音源は追加せず、macOS標準のシステムサウンドのみを使用します。
 
 **録音開始音のマイクへの混入対策について(Amical issue #122を踏まえた判断)**: Amicalでは、録音開始の通知音がマイク準備完了より前に鳴ってしまい、録音の先頭に音が混入する不具合が実際に報告されている。このアプリのAlwaysOnモード(既定)ではマイクは起動時から常時収音済みで、`AudioCaptureEngine.startRecordingLocked()`がプリロールをリングバッファから切り出すのは`Coordinator.state`が`.recording`に変わった直後(=効果音再生の合図とほぼ同時)であり、この切り出し自体は効果音の実際の再生開始(`NSSound.play()`呼び出し後もハードウェア出力までの遅延がある)より先に完了するため、**プリロールそのものへの混入は起きにくい**。
 
@@ -267,10 +273,10 @@ whisper.cppの生出力には、実際のディクテーションで「音声入
 ### 全体パイプライン
 
 ```
-whisper.cpp生出力 → (Settings.formattingEnabled == trueなら) OllamaFormatter.format() → Coordinator.onTranscriptionResult → TextInserter
+whisper.cpp生出力 → (ジョブの設定スナップショットでformattingEnabled == trueなら) TextFormatter.format() → DeliveryCoordinator(発話順にコミット) → TextInserter
 ```
 
-`Coordinator`(`Sources/Voicewriter/App/Coordinator.swift`)の`applyFormattingIfNeeded`が整形を呼び出します。整形中も状態は`.transcribing`のままなのでメニューバーは「処理中」表示を継続し、Esc(キャンセル)は整形の`await`中に押されても`discardPendingTranscriptionResult`チェックが整形完了後に行われるため正しく反映されます(`Tests/VoicewriterTests/CoordinatorFormattingTests.swift`で回帰テスト済み)。
+`Coordinator`(`Sources/Voicewriter/App/Coordinator.swift`)の`runJob(_:)`がジョブ単位で認識・整形を呼び出します(`SerialFIFOQueue`で他ジョブと直列化、詳細は「連続音声入力パイプライン」参照)。整形中も表示状態は`.transcribing`のままなのでメニューバーは「処理中」表示を継続し、Esc(キャンセル)は整形の`await`中に押されても`DictationJobRegistry.isCancelled`チェックが整形完了後に行われるため正しく反映されます(`Tests/VoicewriterTests/CoordinatorFormattingTests.swift`で回帰テスト済み)。
 
 **整形が失敗した場合(Ollama未起動・タイムアウト・応答不正等)は、`OllamaFormatter`はエラーをthrowするのみで、`Coordinator`が必ずwhisper.cppの生出力へフォールバックします**。フォールバック時はメニューバーに5秒間だけ軽い警告(⚠️)を表示し、録音・挿入自体は中断しません。
 
@@ -367,17 +373,101 @@ defaults write dev.voicewriter.app micMode -string onDemand
 |---|---|---|
 | Push-to-Talk | F13(修飾キーなし) | keyDownで録音開始、keyUpで録音終了→文字起こし |
 | トグル | ⌥⇧Space | keyUp(離した瞬間)でON/OFF切替。キーリピートでは発火しない |
-| キャンセル | Esc | 録音中は破棄してidleに戻る。文字起こし中は結果を破棄するフラグを立てる。**idle時はグローバルホットキー自体を無効化しており、他アプリのEscを奪わない**(`KeyboardShortcuts.enable/disable`で状態に応じて切り替え) |
+| キャンセル | Esc | **階層的キャンセル**(詳細は「連続音声入力パイプライン」参照): 1. 録音中は現在の録音のみ破棄。2. 録音停止済みグレー待ち(`finalizing`)中は、いま確定処理中の録音自体(=対応するジョブ)を破棄する(他の既に確定済みジョブには影響しない)。3. それ以外の非録音時は、まだ挿入されていない最新(発話順で最後)のジョブ1件をキャンセル。全ジョブを一括キャンセルしたい場合はメニューバーの「すべての処理をキャンセル」を使う。**idle時(未終端ジョブも無い場合)はグローバルホットキー自体を無効化しており、他アプリのEscを奪わない**(`KeyboardShortcuts.enable/disable`で状態に応じて切り替え) |
+
+## 連続音声入力パイプライン
+
+前の発話の認識・整形が完了していなくても、ホットキーで次の録音を即座に開始できます(以前は文字起こし中にホットキーを押すとビープで拒否されていました)。複数の発話ジョブが同時に処理系に存在しうる一方、**テキストの挿入(Cmd+V)は必ず発話順(録音を開始した時点で採番した`sequence`の順)を厳守**します。
+
+### ジョブモデル(`DictationJob`/`DictationJobRegistry`)
+
+録音が1回終わるたびに`DictationJob`(`Sources/Voicewriter/App/DictationJob.swift`)が1つ生成されます。`sequence`は録音開始時(`attemptStartRecording`)に`DictationJobRegistry`が単調増加で採番し、以後の挿入順序の基準になります。「現在録音中(またはfinalizing中)のジョブID」は録音開始時点から存在するため、Escの階層的キャンセル(後述)がその録音自体を正確に対象にでき、キュー上限判定も録音中の枠を正しく数えられます。ジョブは録音開始時点の設定スナップショット(`DictationJobSettingsSnapshot`: 言語・語彙ヒント・VAD有効/無効・整形ON/OFF・整形モデル・整形タイムアウト秒数)を保持しており、**待ち行列中に設定画面から設定を変更しても、既に録音済みのジョブは録音時点の設定のまま処理されます**(`TranscriptionEngine.transcribe`/`TextFormatter.format`は言語・語彙ヒント・VAD有効/無効・モデル名・タイムアウト秒数を呼び出しごとの引数として受け取るようになっており、`Settings`を内部で直接読まない設計に変更しています)。
+
+ジョブの状態は`DictationJobRegistry`(`@MainActor`)が一元管理します。終端状態(`inserted`/`cancelled`/`skipped`/`failed`/`focusMismatch`)は一度確定したら以後変化しません。重要な設計判断として、**「認識・整形の処理が完了したこと」と「終端状態が確定したこと」は同義ではありません**。挿入は`DeliveryCoordinator`がsequence順に揃うまで保留されるため、処理自体は終わっていても実際にコミット(挿入または墓標化)されるまでジョブは「未終端(active)」として扱われます。これによりキュー上限判定・Escの階層的キャンセル(後述)の両方が「まだ発話順の順番待ちをしているジョブ」も正しく対象にできます。
+
+### 録音可否と表示状態の分離(`RecordingState` / `AppState`)
+
+録音を開始できるかどうかは新設の`RecordingState`(`idle`/`recording`/`finalizing`)のみで判定し、処理中のジョブがあるかどうかは録音を一切妨げません。表示用の`AppState`(`idle`/`recording`/`transcribing`、StatusBar/HUD互換)は、`RecordingState`と未終端ジョブの有無から導出される値として維持しています。
+
+`finalizing`は、`stopRecording()`を呼んでから`AudioCaptureEngine`内部の停止グレース(既定100ms、語尾欠落対策)が明けて録音バッファが確定するまでの短い期間です。この間にホットキーで次の録音が要求された場合、即座には開始せず保留し、前ジョブのバッファが確定した直後に自動的に開始します(`AudioCaptureEngine.controlQueue`上の完了処理と新規録音開始が競合しないようにするため)。
+
+### 推論の直列化(`SerialFIFOQueue`)
+
+whisper.cpp(認識)とOllama(整形)は同じUnified Memory/GPUを奪い合うため、両者を共有の`SerialFIFOQueue`(`Sources/Voicewriter/Support/SerialFIFOQueue.swift`、汎用のFIFO直列化actor/クラス)に通し、ジョブ単位で「J1(認識→整形)→J2(認識→整形)→…」の順に完全直列実行します(ステージ単位ではなくジョブ単位でenqueueすることで、J1の整形とJ2の認識が入れ替わらないようにしています)。録音自体はこの直列化から完全に独立しており、次の録音は認識・整形の完了を待たずに開始できます。起動時のOllama先読み(`OllamaFormatter.preload()`)も`Coordinator.enqueueBackgroundInferenceTask(_:)`経由でこのFIFOに通しており、起動直後にユーザーがすぐ話し始めた場合でも初回のwhisper.cpp呼び出しと同時にGPU/Unified Memoryを奪い合わないようにしています。
+
+このFIFOは`Coordinator`が所有します。`DynamicTranscriptionEngine.reload()`がエンジン(内部の実装ごと)を差し替える設計のため、エンジン内部のキューに順序保証を委ねると設定変更の瞬間に並行実行が起きうるためです。各ステージ(認識/整形)の実行前にはジョブのキャンセルフラグを確認し、キャンセル済みならそのステージをスキップして墓標化します。whisper_full自体の実行中断は行いません(結果を破棄する論理キャンセルのみ)。一方、LLM整形(Ollama)の実行中キャンセルは、`DictationJobRegistry`に登録したキャンセルハンドル(整形呼び出しを包む`Task`の`cancel()`)を使って実際にURLSessionのリクエストごと中断させ、FIFOの先頭を即座に解放します(以前はRegistryのフラグを立てるだけで、実行中のOllamaリクエストが完了/タイムアウトするまでFIFOの先頭を占有し続けていました)。キャンセル起因のエラーでは「整形失敗」警告(`onFormattingFailed`)は出しません。
+
+### 挿入のリオーダーバッファ(`DeliveryCoordinator`)
+
+`DeliveryCoordinator`(`Sources/Voicewriter/App/DeliveryCoordinator.swift`)が発話順の厳守を担当します。`nextCommitSequence`を維持し、sequence順に結果が揃うまで`pending`に貯めておきます(#2の処理が先に完了しても、#1がコミットされるまで挿入を待たせます)。キャンセル/無音スキップ/失敗/フォーカス不一致もすべて「墓標」としてsequenceの順序を消費するため、欠番のジョブを待ち続けて後続の挿入が詰まることはありません。
+
+**録音中(または停止グレー中)は、コミット処理自体を丸ごと保留**し、録音終了後にまとめて順次コミットします。これは、録音中に別ジョブの結果が挿入されると挿入先を取り違えたり、HUDの録音中表示(レベルメーター)を完了通知が上書きしてしまう事故を防ぐためです。挿入直前のフォーカス確認〜Cmd+V送出はMainActor上の単一のクリティカル区間として行い、`DeliveryCoordinator.isInsertionCriticalSection`がtrueの間、新規録音の開始要求はこの区間が**実際に終わるまで無条件に待ちます**(`onInsertionCriticalSectionEnded(_:)`によるイベント駆動のコールバックで通知され、タイムアウトによる打ち切りはありません。以前は最大100ms(20ms×5回)のポーリングで打ち切り、区間が実際に閉じたかを確認せずに録音を開始してしまう可能性がありました)。これにより「録音中にCmd+Vを送出しない」「挿入クリティカル区間中に録音を開始しない」という不変条件を無条件に保証します。
+
+フォーカスガードはジョブ単位で二段階に行います。まず`DeliveryCoordinator`が、ジョブ記録時のフロントモストアプリと、実際にコミットする(挿入する)時点のフロントモストアプリを比較します。ここを通過した後も、`TextInserter`内部で実際にCmd+Vを送出する直前にもう一度フロントモストアプリの最終確認を行います(1回目の比較からCmd+V送出までの間に`await`を挟むため、その間にユーザーがアプリを切り替えるTOCTOUが起こりえます)。いずれの段階で不一致が検出されても自動挿入せず履歴へ積みます(メニューバーの「最近の文字起こし結果」から手動コピーで回収可能。以前の「最後の文字起こし結果をコピー」を直近5件の履歴に拡張しました)。
+
+### Escの階層的キャンセル
+
+1. 録音中 → 現在の録音のみキャンセル(`AudioCaptureEngine.cancelRecording()`で実際に破棄。対応するジョブも`.cancelled`として終端する)
+2. 録音停止済みグレー待ち(`finalizing`)中 → **いま確定処理中の録音自体(そのジョブの`sequence`)をキャンセル**する。他の既に確定・キュー投入済みのジョブには影響しない(以前はこのケースを非録音時と同じ扱いにしてしまい、「まだ挿入されていない最新の未終端ジョブ」を誤ってキャンセルしていた。sequenceを録音開始時に採番するようになったことで、finalizing中でも「いま確定処理中の録音」自身のsequenceを直接指定できるようになった)
+3. それ以外の非録音時(idle) → まだ挿入されていない最新(sequence最大)のジョブ1件をキャンセル(「直前に話した内容の取り消し」がユーザー意図に近いと判断。コミット処理が既に始まっているジョブは対象から除外する、後述)
+4. メニューバーの「すべての処理をキャンセル」→ 未終端の全ジョブに一括でキャンセルを要求(現在録音中/finalizing中のジョブのsequenceは明示的に除外し、進行中の録音自体はキャンセルしない)
+
+コミット処理(`DeliveryCoordinator.commit(sequence:entry:)`)が実際に開始された(`beginCommitting`)ジョブは、以後キャンセル要求を受け付けない(`requestCancel`が無視され、`latestCancellableSequence`の対象からも外れる)。挿入するかどうかは既に決定済みのため、これを許すとEscとの競合で「キャンセルできた」と誤認させてしまう(実際には挿入される)ため。一方、墓標化(スキップ/失敗)がコミットされる直前にキャンセルが要求されていた場合は、その墓標状態より`.cancelled`を優先する。
+
+### キュー上限
+
+未終端ジョブ(コミット待ちも含む)は8件を上限とし(`Coordinator.maxUnterminatedJobs`)、到達時は新規録音の開始を拒否します。単なるビープに加え、HUDに「処理が追いついていません」という専用の表示を出し、通常の「拒否された」ビープと区別できるようにしています。`finalizing`中に保留していた開始要求がこの上限で拒否された場合も、`recordingState`は必ず`.idle`へ戻ります(以前はここで`.finalizing`のまま残ってしまい、以後永久に新規録音を開始できなくなる不具合がありました)。
+
+### `TextInserter`のAPI変更
+
+`TextInserter.onPasted`は共有プロパティをやめ、`insert(text:expectedFrontmostProcessIdentifier:onPasted:)`のコール単位の引数に変更しました。複数ジョブの挿入が重なりうる設計では、共有プロパティのままだと後から設定した`onPasted`が先行する挿入の完了通知まで乗っ取ってしまう競合があったためです。`expectedFrontmostProcessIdentifier`は、`sendCommandV()`送出直前の最終フォーカス確認用に追加した引数です(不一致なら`TextInsertionError.focusChanged`をthrowし、`DeliveryCoordinator`はこれを`.focusMismatch`として扱います)。
+
+### 不変条件(単体・結合テストで担保)
+
+同時録音は最大1つ、同一whisperコンテキストへの同時呼び出しなし、終端状態は一度だけ確定、挿入はsequence順、墓標も順序を消費、**録音中はCmd+Vを送出せず、挿入クリティカル区間中は録音を開始しない(タイムアウトによる打ち切りなし)**、フォーカス不一致の結果は履歴として失われない、完了通知が録音中のHUD表示を上書きしない、コミット開始後のジョブはキャンセル不能。
+
+## 連続音声入力パイプラインへのCodex検証レビュー対応
+
+連続音声入力パイプライン導入直後の実装に対するCodexの検証レビューで12件の指摘を受け、以下の通り対応しました(上記「連続音声入力パイプライン」の各節は対応後の仕様として既に反映済みです)。
+
+**High(3件)**
+
+1. **キュー満杯で永久にfinalizingのまま残る(`Coordinator.swift`)**: `finalizeRecordingTransition()`が保留していた開始要求をキュー満杯で拒否した際、`recordingState`を`.finalizing`のまま放置していた。`attemptStartRecording(source:)`を成功可否を返す関数に変え、拒否時は必ず`.idle`へ戻すようにした。
+2. **finalizing中の短いPTTでkeyUpが消失し録音が止まらなくなる(`Coordinator.swift`)**: `beginPushToTalk()`がfinalizing中のkeyDownを保留要求として積む一方、`endPushToTalk()`は`.recording`以外を無視していたため、保留中に来たkeyUpが破棄され、後で保留要求が実行されると対応するkeyUpの無い録音になっていた。PTTキーの押下状態(`isPushToTalkKeyDown`)を追跡し、開始前にkeyUpが来ていた保留要求は取り消すようにした。
+3. **挿入クリティカル区間の待機がタイムアウトで打ち切られ、相互排除が破れうる(`Coordinator.swift`/`DeliveryCoordinator.swift`)**: 録音開始側の待機が20ms×5回(最大100ms)で打ち切られ、その後はクリティカル区間の状態を再確認せずに録音を開始してしまっていた。タイムアウトポーリングをやめ、`DeliveryCoordinator.onInsertionCriticalSectionEnded(_:)`というイベント駆動のコールバックに置き換え、区間が実際に終わるまで無条件に待つようにした。さらにCodexの検証レビューで、目覚め(`continuation.resume()`)から実際に再開されるまでの間に、`DeliveryCoordinator`が次のジョブのコミットへ進んで新たな区間を開始してしまいうる(一度の待機だけでは不十分な)ケースを指摘されたため、目覚めるたびに状態を再確認し、まだ(または再び)trueの間はループして待ち続けるよう修正した。
+
+**Medium(9件)**
+
+4. **フォーカスTOCTOU(`DeliveryCoordinator.swift`/`TextInserter.swift`)**: フォーカス比較が`DeliveryCoordinator`で1回だけだったため、その後の`await`中にユーザーがアプリを切り替えるとCmd+Vが別アプリに送出されうる。`TextInserter`内部の`sendCommandV()`直前にも期待PIDの最終確認を追加し、不一致なら`TextInsertionError.focusChanged`→`.focusMismatch`として扱うようにした。
+5. **finalizing中のEscが別ジョブをキャンセルしてしまう(`Coordinator.swift`)**: `cancelRecording()`がfinalizingを非録音時と同じ扱いにし、Registry上の「まだ挿入されていない最新のジョブ」(既に別ジョブとして確定済みのことがある)を誤ってキャンセルしていた。sequenceを録音開始時に採番するようにした(指摘#7)ことで、finalizing中のEscは「いま確定処理中の録音自身」の`sequence`を直接対象にできるようにした。
+6. **EscがOllama通信を中断しない(`OllamaFormatter.swift`/`Coordinator.swift`/`DictationJobRegistry.swift`)**: キャンセルはRegistryのフラグを立てるだけで、実行中のURLSessionリクエストが解放されずFIFOの先頭を占有し続けていた。ジョブ単位のキャンセルハンドル(整形呼び出しを包む`Task`の`cancel()`)を`DictationJobRegistry`に登録し、キャンセル時に実際にタスクを中断してFIFOを即座に解放するようにした。キャンセル起因のエラーでは「整形失敗」警告は出さない。
+7. **採番位置がdidFinishRecording内だった(`Coordinator.swift`)**: 仕様(README)通り録音開始時に`sequence`を採番するように修正し、「現在の録音のジョブID」が録音中から存在するようにした(指摘#5・#10とも整合)。
+8. **設定スナップショット漏れ(`DictationJob.swift`/`TranscriptionEngine.swift`/`WhisperCppEngine.swift`/`TextFormatter.swift`/`OllamaFormatter.swift`)**: VAD有効/無効・Ollamaタイムアウトが実行時にグローバルな`Settings`を直接読んでいた。ジョブの設定スナップショット(`DictationJobSettingsSnapshot`)に`vadEnabled`/`formattingTimeoutSeconds`を追加し、呼び出しごとの引数として渡すようにした。
+9. **HUDのフェーズ復元(`StatusHUDController.swift`)**: 録音終了後に処理中フェーズ表示へ戻らない、また完了通知(成功/失敗等)が別ジョブの認識中/整形中表示を上書きしたまま自動的に隠れてしまう問題があった。直近の処理フェーズ(`lastPhase`)と未終端件数を保持し、録音終了時・一時表示の自動非表示タイミングで、未終端ジョブが残っていれば処理中表示を再計算して出すようにした。
+10. **挿入コミット開始後のキャンセル不能化(`DictationJobRegistry.swift`/`DeliveryCoordinator.swift`)**: コミット開始(`beginCommitting`)後は`requestCancel`を無視し、`latestCancellableSequence`の対象からも除外するようにした(Escとの競合で`.inserted`なのに「キャンセルできた」と誤認させないため)。また墓標化(スキップ/失敗)の直前にキャンセル要求済みだった場合は`.cancelled`を優先するようにした。
+11. **アプリ終了時の後始末(`AppDelegate.swift`)**: `applicationWillTerminate`で、挿入クリティカル区間中なら最大1秒程度終了を遅らせてクリップボード復元を完了させるようにした(`RunLoop`を短時間ポンプして待つ)。未終端ジョブが残っている場合は件数をログに出す。**既知の制約**: 完全なドレイン(全ジョブの処理・挿入完了を待つ)は行わない。
+12. **Ollamaプリロードを推論FIFO経由に(`AppDelegate.swift`/`Coordinator.swift`)**: `Coordinator.enqueueBackgroundInferenceTask(_:)`を追加し、起動時のOllamaプリロードを`Task.detached`ではなく推論FIFO経由で実行するようにした。初回のwhisper.cpp呼び出しと同時にGPU/Unified Memoryを奪い合わないようにするため。
+
+### 回帰テスト(連続音声入力パイプラインのレビュー対応)
+
+`CoordinatorPipelineTests`(指摘#1・#2・#3・#5)・`CoordinatorFormattingTests`(指摘#6・#8のうち整形タイムアウト)・`CoordinatorRecordingSkipTests`(指摘#8のうちVAD有効/無効)・`DictationJobRegistryTests`(指摘#10のコミット後キャンセル不能・除外)・`DeliveryCoordinatorTests`(指摘#4のフォーカス最終確認・指摘#10の墓標優先度)に回帰テストを追加し、既存116件と合わせて計127件が`swift test`ですべて成功することを確認済みです。指摘#7(採番位置)・#9(HUDフェーズ復元)・#11(終了時の後始末)・#12(プリロードのFIFO経由化)は、上記各テストの前提・副次効果として間接的に検証されているか、実機での対話的確認が必要な項目です(下記「未確認・今後の課題」参照)。
+
+### 見送った項目(連続音声入力パイプラインのレビュー対応)
+
+なし。指摘された12件はすべて上記の通り対応済みです。ただし#11(アプリ終了時の後始末)は仕様として「完全なドレインは行わない」ことを明示的な既知の制約としています。
 
 ## 構成
 
 ```
 Sources/Voicewriter/
-  App/              アプリ起動・状態機械・メニューバーUI・設定値
+  App/              アプリ起動・状態機械・メニューバーUI・設定値・連続音声入力パイプライン
     main.swift
     AppDelegate.swift
-    Coordinator.swift       idle/recording/transcribing の状態機械
-    StatusBarController.swift
+    Coordinator.swift       録音可否(RecordingState)・表示状態(AppState)の司令塔。ジョブ生成とSerialFIFOQueueへの投入を担う
+    DictationJob.swift              1発話分のジョブモデル・設定スナップショット・終端状態
+    DictationJobRegistry.swift      ジョブごとの状態(未終端/終端)・キャンセルフラグの一元管理
+    DeliveryCoordinator.swift       発話順(sequence順)を厳守するテキスト挿入のリオーダーバッファ
+    StatusBarController.swift       メニューバーUI(状態表示・文字起こし結果の履歴・すべてキャンセル)
     Settings.swift
     SettingsWindowController.swift  設定ウィンドウの生成・前面化(LSUIElement対応)
     LaunchAtLogin.swift             SMAppServiceによるログイン時起動の登録/解除
@@ -408,15 +498,16 @@ Sources/Voicewriter/
     OllamaFormatter.swift      Ollama /api/chat 実装(構造化出力・think無効化・keep_alive・タイムアウト)
     OllamaModelLister.swift    設定画面用、/api/tagsからのモデル一覧取得
   TextInsertion/    カーソル位置へのテキスト挿入(Amical方式)
-    TextInserter.swift
+    TextInserter.swift        insert(text:onPasted:)。TextInsertingプロトコルでテスト容易化
     AccessibilityPermission.swift
   HUD/              状態表示HUD(浮遊ピル、詳細は「状態表示HUDと効果音」参照)
     StatusHUDPanel.swift       フォーカスを奪わないNSPanelサブクラス
-    StatusHUDController.swift  Coordinator等からの配線・表示/非表示のフェード制御
+    StatusHUDController.swift  Coordinator等からの配線・集約スナップショットからの表示導出・表示/非表示のフェード制御
     StatusHUDViewModel.swift
     StatusHUDContentView.swift SwiftUI製の見た目(NSHostingViewで載せる)
   Support/
     GenerationCounter.swift
+    SerialFIFOQueue.swift      汎用のFIFO直列化(認識・整形の直列実行に使用、詳細は「連続音声入力パイプライン」参照)
     SoundEffects.swift  録音開始/挿入完了の効果音(詳細は「状態表示HUDと効果音」参照)
 Sources/VerifyWhisper/
   main.swift        whisper.cpp統合の検証用スタンドアロンCLI
@@ -427,9 +518,15 @@ Tests/VoicewriterTests/
   AudioPreprocessingTests.swift         先頭無音/低エネルギーノイズのトリムの回帰テスト
   CoordinatorCancelDuringTranscribingTests.swift  文字起こし中のEscキャンセルの回帰テスト
   FormattingPromptTests.swift            プロンプト組み立て・レスポンス解析(構造化JSON/タグ両対応)・長さ比チェックの単体テスト
-  CoordinatorFormattingTests.swift       整形成功/失敗時のフォールバック・整形中のEscキャンセル・語彙ヒント伝播・HUD用onPhaseChanged通知の回帰テスト
+  CoordinatorFormattingTests.swift       整形成功/失敗時のフォールバック・整形中のEscキャンセル(実際のTaskキャンセルによる中断を含む)・設定スナップショット伝播(整形タイムアウト含む)・HUD用onPhaseChanged通知の回帰テスト
+  CoordinatorRecordingSkipTests.swift    ハルシネーション対策(第1層・第2層・第5層)のCoordinator側の統合テスト・VAD有効/無効の設定スナップショット伝播の回帰テスト
   OllamaFormatterIntegrationTests.swift  実際のOllamaへHTTPリクエストを送る統合テスト(Ollama未起動ならXCTSkip)
   HUDSettingsTests.swift                 hudEnabled/soundEffectsEnabled設定のデフォルト値・永続化の回帰テスト
+  SerialFIFOQueueTests.swift             FIFO直列化(#2が先に完了しても#1を待つ等)の単体テスト
+  DictationJobRegistryTests.swift        ジョブの未終端/終端状態・キャンセルフラグ・キュー上限判定・コミット開始後のキャンセル不能化の単体テスト
+  DeliveryCoordinatorTests.swift         リオーダーバッファ(sequence順コミット・墓標による順序消費・録音中の保留・フォーカス不一致(TextInserter内最終確認含む)・挿入失敗・墓標のキャンセル優先度)の単体テスト
+  TextInserterTests.swift                 insert(text:onPasted:)がコール単位で完了通知を受け取る回帰テスト
+  CoordinatorPipelineTests.swift          連続音声入力パイプライン全体(即座の次録音開始・発話順の厳守・Esc階層・キュー上限(finalizing中拒否後のidle復帰含む)・停止グレー中の再押下(短いPTTの取り消し含む)・挿入クリティカル区間の無条件待機・墓標による順序消費)の結合テスト
 Resources/
   Info.plist
 vendor/
@@ -469,6 +566,7 @@ scripts/
 - **無音・誤押下時のハルシネーション対策(多層防御、詳細は該当セクション参照)追加後**、`swift build` / `swift build -c release` / `scripts/build-app.sh release` / `swift test`(90件、`AudioPreprocessingTests`に6件・`HallucinationFilterTests`9件・`WhisperCppEngineSegmentFilterTests`7件・`CoordinatorRecordingSkipTests`5件を新規追加)がすべて成功することを確認済み。`swift run -c release verify-whisper`で以下を確認:
   - 新規作成した完全な無音WAV(`scripts/fixtures/sample-silence-16k.wav`)で、VAD無効(デコードパラメータのみ)だと実際に「ご視聴ありがとうございました」というハルシネーションが再現すること、VAD有効(`VERIFY_WHISPER_VAD=1`)にすると`Final speech segments after filtering: 0`となり出力が完全に空になることを確認済み(公式README記載のVAD挙動の実地確認)。
   - 既存の日本語フィクスチャ(`sample-ja-16k.wav`ほか計7件)を`no_speech_thold`差し戻し(0.2→0.6)・`speech_pad_ms`変更(30→100ms)後に再実行し、いずれも変更前と完全に同一の認識結果(回帰なし)であることを確認済み。
+- **連続音声入力パイプライン化後**(詳細は上記「連続音声入力パイプライン」参照)、`swift build`(警告ゼロ、Swift 6言語モードで将来エラーになりうる`nonisolated`コンテキストからのMainActor隔離静的プロパティ参照を`??`フォールバック方式で解消)/ `swift build -c release` / `scripts/build-app.sh release` / `swift test`(116件、新規`SerialFIFOQueueTests`2件・`DictationJobRegistryTests`7件・`DeliveryCoordinatorTests`6件・`TextInserterTests`4件・`CoordinatorPipelineTests`6件を追加、既存テストは新しい非同期API・コールバック形状に合わせて更新)がすべて成功することを確認済み。`swift run -c release verify-whisper scripts/fixtures/sample-ja-16k.wav`でも従来通りの認識結果(回帰なし)を確認済み。`.app`を起動し、`ps aux`でメニューバー常駐プロセスとして生存し続けること、`log show`でクラッシュ・診断レポート(`~/Library/Logs/DiagnosticReports/`)なく、起動時のOllamaプリロードリクエストが成功(HTTP 200)することを確認済み。実際のキー操作を伴う対話的な実機確認は未実施(上記「連続音声入力パイプラインの実機確認」参照)。
 
 ## 並行処理まわりの修正(Codexレビュー対応)
 
@@ -749,8 +847,8 @@ whisper.cpp v1.9.1の`whisper.h`には、セグメント単位のno_speech確率
 - 上記「並行処理まわりの修正」で追加した以下の挙動は、実機での対話的な確認(実際のキー押下・Bluetoothデバイスの抜き差し・複数アプリ間でのフォーカス切り替えなど)を行っていません。
   - `.transcribing`中にEsc(キャンセル)を押すと、結果が挿入されずに破棄されること(メニューバー状態がidleに戻らない点に注意: `.transcribing`のままキャンセル待ち状態が続く想定通りの挙動か含め確認)
   - idle時にEscを押しても他アプリ側でEscが正常に機能する(グローバルホットキーとして奪われない)こと
-  - 録音中に別アプリへフォーカスを切り替えてから文字起こしを終えると、自動挿入が中止されメニューバーに警告が出て、「最後の文字起こし結果をコピー」から結果を回収できること
-  - 文字起こし中にPTT/トグルを操作するとビープ音が鳴ること
+  - 録音中に別アプリへフォーカスを切り替えてから文字起こしを終えると、自動挿入が中止されメニューバーに警告が出て、「最近の文字起こし結果」から結果を回収できること
+  - (連続音声入力パイプライン導入により、この項目は挙動が変わった。詳細は下記「連続音声入力パイプラインの実機確認」参照)文字起こし中にPTT/トグルを操作するとビープ音が鳴ること→**現在は文字起こし中でも即座に次の録音が開始され、ビープでは拒否されない**(未終端ジョブがキュー上限に達した場合のみ拒否・専用HUD表示)
   - 5分以上録音し続けると自動的に文字起こしへ回ること(長時間録音の実機確認)
   - Bluetoothヘッドセット等の抜き差しで、フォーマット不正/コンバータ生成失敗が実際に発生した場合にメニューバー警告が出て録音状態が安全にidleへ戻ること(通常のデバイス切替では従来通り自動復旧する想定)
   - 設定画面でwhisper.cppモデル未配置からダウンロード完了、または再試行(失敗後の「再試行」ボタン)・ダウンロード中キャンセルの一連の操作
@@ -765,3 +863,17 @@ whisper.cpp v1.9.1の`whisper.h`には、セグメント単位のno_speech確率
   - 実際にホットキーを一瞬だけ押してすぐ離した場合(第1層)、実際に無音の部屋でホットキーを押した場合(第2層)に、それぞれ`whisper_full`が呼ばれず、HUDに「短すぎるためキャンセル」「無音のためキャンセル」が表示されること。
   - VADモデルの初回自動ダウンロード(`VadModelAutoProvisioner`)が、実際にネットワーク接続がある初回起動時にバックグラウンドで成功し、ログ(`VAD model auto-downloaded and installed at ...`)が出ること。オフライン環境や既存モデル配置済み環境での挙動(ダウンロードをスキップ/失敗を無視して起動を継続すること)も未確認です。
   - 実マイクでの息継ぎ・小声の相槌など、エネルギーゲート(第2層)の閾値(`globalRmsThreshold=0.003`, `maxFrameRmsThreshold=0.006`)が実際のマイク環境のノイズフロアと比べて適切かどうか(閾値が厳しすぎて小声発話を誤って棄却しないか、緩すぎて環境ノイズのみの録音を通してしまわないか)は、合成フィクスチャでの確認に留まっており実機での様子見が必要です。
+
+### 連続音声入力パイプラインの実機確認
+
+上記「連続音声入力パイプライン」で追加した挙動は、単体・結合テスト(`SerialFIFOQueueTests`/`DictationJobRegistryTests`/`DeliveryCoordinatorTests`/`TextInserterTests`/`CoordinatorPipelineTests`/`CoordinatorFormattingTests`/`CoordinatorRecordingSkipTests`、計127件全テストがグリーン)・実際の`.app`起動(ログにクラッシュなし、Ollamaへのpreloadリクエスト成功、メニューバー常駐を確認)までは確認済みですが、以下は実際のキー操作を伴う実機での対話的な確認を行っていません。
+
+- **既知の制約: アプリ終了時のドレインは完全ではない(指摘#11)**。`applicationWillTerminate`は、挿入クリティカル区間(フォーカス確認〜Cmd+V送出、ペーストボード復元待ち)が進行中の場合のみ最大1秒程度終了を遅らせるが、認識・整形待ち/挿入待ちの未終端ジョブそのものの処理完了までは待たない(件数はログに出すのみ)。アプリ終了直前に複数の発話が未処理のまま残っていた場合、それらは挿入されずに失われる。実機での確認(終了直前にディクテーションを連投し、`Cmd+Q`直後にペーストボードが正しく復元されること・ログに未終端件数の警告が出ること)は未実施。
+
+- 前の発話の認識・整形中に連続してホットキーを押し、実際に体感として即座に次の録音が始まること(ビープで拒否されないこと)。
+- 複数回連続でディクテーションした際、挿入されるテキストが必ず発話順になること(認識・整形の実処理時間はテキストの長さ・整形モデルの負荷で変動するため、理論上は完了順が入れ替わりうる)。
+- 録音中に前の発話の処理が完了しても、録音終了までテキストが挿入されないこと(誤って別アプリにペーストされる事故が起きないこと)。
+- Escを非録音時に押すと直前に話した内容(最新のジョブ)だけがキャンセルされ、メニューバーの「すべての処理をキャンセル」で未終端の全ジョブが一括キャンセルされること。
+- 未終端ジョブが8件に達するほど早口で連続入力した場合に、9件目のホットキーが拒否され、通常のビープと異なる「処理が追いついていません」表示が出ること(実運用でこの上限に到達する頻度自体も未確認)。
+- 停止グレー(約100ms)の間に素早く次のホットキーを押した際、体感の録音開始レスポンスが損なわれていないこと。
+- HUDの「録音中 +N件処理中」「認識中… 残りN件」等の残件数表示が、実際の連続入力時に正しく増減すること。

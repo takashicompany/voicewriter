@@ -3,20 +3,35 @@ import AppKit
 /// メニューバーアイコンとメニュー(録音状態表示 / 設定プレースホルダ / 終了)を管理する。
 @MainActor
 final class StatusBarController {
+    /// 直近の文字起こし結果履歴(発話順)。挿入の成否(自動挿入済み/フォーカス不一致で見送り)によらず
+    /// 記録し、メニューから手動コピーして回収できるようにする
+    /// (「最後の結果をコピー」を直近数件の履歴に拡張したもの)。
+    private struct HistoryEntry {
+        let sequence: Int
+        let text: String
+    }
+
+    /// 履歴として保持する最大件数。
+    private static let maxHistoryEntries = 5
+
     private let statusItem: NSStatusItem
     private let stateMenuItem: NSMenuItem
     private let settingsMenuItem: NSMenuItem
-    private let copyLastResultMenuItem: NSMenuItem
+    private let historyMenuItem: NSMenuItem
+    private let historySubmenu: NSMenu
+    private let cancelAllMenuItem: NSMenuItem
     private let warningMenuItem: NSMenuItem
     private let warningSeparator: NSMenuItem
     private let menu: NSMenu
     private var currentState: AppState = .idle
     private var warnings: [String] = []
-    private var lastResult: String?
+    private var history: [HistoryEntry] = []
     private let onOpenSettings: () -> Void
+    private let onCancelAllJobs: () -> Void
 
-    init(coordinator: Coordinator, onOpenSettings: @escaping () -> Void) {
+    init(coordinator: Coordinator, onOpenSettings: @escaping () -> Void, onCancelAllJobs: @escaping () -> Void) {
         self.onOpenSettings = onOpenSettings
+        self.onCancelAllJobs = onCancelAllJobs
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
 
         let menu = NSMenu()
@@ -34,16 +49,23 @@ final class StatusBarController {
         menu.addItem(NSMenuItem.separator())
 
         settingsMenuItem = NSMenuItem(title: "設定...", action: #selector(openSettings), keyEquivalent: ",")
-        copyLastResultMenuItem = NSMenuItem(title: "最後の文字起こし結果をコピー", action: #selector(copyLastResult), keyEquivalent: "")
-        copyLastResultMenuItem.isEnabled = false
+
+        historySubmenu = NSMenu()
+        historyMenuItem = NSMenuItem(title: "最近の文字起こし結果", action: nil, keyEquivalent: "")
+        historyMenuItem.submenu = historySubmenu
+        historyMenuItem.isEnabled = false
+
+        cancelAllMenuItem = NSMenuItem(title: "すべての処理をキャンセル", action: #selector(cancelAllJobs), keyEquivalent: "")
 
         // NSObjectを継承しないこのクラスでは、全ストアドプロパティの初期化が終わるまで`self`を使えない
         // (target割り当ても含む)ため、生成をすべて済ませてからまとめてtargetを割り当てる。
         settingsMenuItem.target = self
         menu.addItem(settingsMenuItem)
 
-        copyLastResultMenuItem.target = self
-        menu.addItem(copyLastResultMenuItem)
+        menu.addItem(historyMenuItem)
+
+        cancelAllMenuItem.target = self
+        menu.addItem(cancelAllMenuItem)
 
         menu.addItem(NSMenuItem.separator())
 
@@ -72,11 +94,45 @@ final class StatusBarController {
         refreshWarningMenuItem()
     }
 
-    /// 直近の文字起こし結果を保持する。自動挿入の成否によらず呼ぶこと
+    /// 文字起こし結果を履歴へ記録する。自動挿入の成否によらず呼ぶこと
     /// (フォーカス変化で自動挿入を中止した場合でも、ここから手動でコピーして回収できるようにするため)。
-    func updateLastResult(_ text: String) {
-        lastResult = text
-        copyLastResultMenuItem.isEnabled = !text.isEmpty
+    /// 直近`maxHistoryEntries`件のみ保持し、新しいものを先頭に表示する。
+    func recordHistory(sequence: Int, text: String) {
+        guard !text.isEmpty else { return }
+        history.removeAll { $0.sequence == sequence }
+        history.append(HistoryEntry(sequence: sequence, text: text))
+        if history.count > Self.maxHistoryEntries {
+            history.removeFirst(history.count - Self.maxHistoryEntries)
+        }
+        refreshHistoryMenu()
+    }
+
+    private func refreshHistoryMenu() {
+        historySubmenu.removeAllItems()
+        if history.isEmpty {
+            historyMenuItem.isEnabled = false
+            let empty = NSMenuItem(title: "(履歴なし)", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            historySubmenu.addItem(empty)
+            return
+        }
+        historyMenuItem.isEnabled = true
+        for entry in history.reversed() {
+            let preview = Self.previewText(for: entry.text)
+            let item = NSMenuItem(title: preview, action: #selector(copyHistoryEntry(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = entry.text
+            historySubmenu.addItem(item)
+        }
+    }
+
+    private static func previewText(for text: String) -> String {
+        let collapsed = text.replacingOccurrences(of: "\n", with: " ")
+        let maxLength = 28
+        if collapsed.count > maxLength {
+            return String(collapsed.prefix(maxLength)) + "…"
+        }
+        return collapsed
     }
 
     private func refreshWarningMenuItem() {
@@ -137,11 +193,15 @@ final class StatusBarController {
         onOpenSettings()
     }
 
-    @objc private func copyLastResult() {
-        guard let lastResult else { return }
+    @objc private func copyHistoryEntry(_ sender: NSMenuItem) {
+        guard let text = sender.representedObject as? String else { return }
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
-        pasteboard.setString(lastResult, forType: .string)
+        pasteboard.setString(text, forType: .string)
+    }
+
+    @objc private func cancelAllJobs() {
+        onCancelAllJobs()
     }
 
     @objc private func quit() {

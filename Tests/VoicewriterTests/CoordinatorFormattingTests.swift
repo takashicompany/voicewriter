@@ -22,6 +22,15 @@ private final class FakeClock {
     }
 }
 
+/// テスト用のフェイク`TextInserting`。即座に挿入完了とみなす。
+private final class FakeTextInserter: TextInserting {
+    private(set) var insertedTexts: [String] = []
+    func insert(text: String, expectedFrontmostProcessIdentifier: pid_t?, onPasted: @escaping () -> Void) async throws {
+        insertedTexts.append(text)
+        onPasted()
+    }
+}
+
 /// ハルシネーション対策の第2層(エネルギーゲート)を通過させるためのダミー音声サンプル。
 private let nonSilentDummySamples: [Float] = Array(repeating: Float(0.3), count: 4800)
 
@@ -29,7 +38,7 @@ private let nonSilentDummySamples: [Float] = Array(repeating: Float(0.3), count:
 private final class ImmediateTranscriptionEngine: TranscriptionEngine {
     let text: String
     init(text: String) { self.text = text }
-    func transcribe(samples: [Float], sampleRate: Double) async throws -> String { text }
+    func transcribe(samples: [Float], sampleRate: Double, language: String, vocabularyHint: String, vadEnabled: Bool) async throws -> String { text }
 }
 
 /// テスト用のフェイク`TextFormatter`。成功/失敗を固定できるほか、
@@ -46,10 +55,14 @@ private actor ControllableTextFormatter: TextFormatter {
     private var hasStarted = false
     private(set) var callCount = 0
     private(set) var lastVocabularyHint: String?
+    private(set) var lastModel: String?
+    private(set) var lastTimeoutSeconds: TimeInterval?
 
-    func format(text: String, vocabularyHint: String) async throws -> String {
+    func format(text: String, vocabularyHint: String, model: String, timeoutSeconds: TimeInterval) async throws -> String {
         callCount += 1
         lastVocabularyHint = vocabularyHint
+        lastModel = model
+        lastTimeoutSeconds = timeoutSeconds
         hasStarted = true
         startedContinuation?.resume()
         startedContinuation = nil
@@ -84,7 +97,7 @@ private struct FixedTextFormatter: TextFormatter {
     }
     let outcome: Outcome
 
-    func format(text: String, vocabularyHint: String) async throws -> String {
+    func format(text: String, vocabularyHint: String, model: String, timeoutSeconds: TimeInterval) async throws -> String {
         switch outcome {
         case .success(let text): return text
         case .failure(let error): throw error
@@ -93,6 +106,37 @@ private struct FixedTextFormatter: TextFormatter {
 }
 
 private enum FakeFormatterError: Error { case boom }
+
+/// `Task.cancel()`に反応してすぐ`CancellationError`をthrowするフェイク`TextFormatter`。
+/// 実際の`OllamaFormatter`(`URLSession.data(for:)`がSwift ConcurrencyのTaskキャンセルを
+/// 尊重し、キャンセルされると即座にエラーを投げる)の挙動を模す。Coordinatorが登録した
+/// キャンセルハンドル(`Task.cancel()`)が実際に整形処理を中断させることを検証するために使う
+/// (Codexレビュー指摘#6: 以前はRegistryのフラグを立てるだけで、実行中のタスクは解放されず
+/// FIFOの先頭を占有し続けていた)。
+private actor CancellationAwareTextFormatter: TextFormatter {
+    private(set) var callCount = 0
+    private var startedContinuation: CheckedContinuation<Void, Never>?
+    private var hasStarted = false
+
+    func format(text: String, vocabularyHint: String, model: String, timeoutSeconds: TimeInterval) async throws -> String {
+        callCount += 1
+        hasStarted = true
+        startedContinuation?.resume()
+        startedContinuation = nil
+        // 実際のURLSession.data(for:)同様、キャンセルされるまで待ち続ける。
+        while !Task.isCancelled {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        throw CancellationError()
+    }
+
+    func waitUntilFormatStarted() async {
+        if hasStarted { return }
+        await withCheckedContinuation { continuation in
+            startedContinuation = continuation
+        }
+    }
+}
 
 /// LLM整形パイプライン統合のテスト:
 /// 1. 整形が成功した場合、挿入されるテキストは整形後のものになる
@@ -103,12 +147,6 @@ private enum FakeFormatterError: Error { case boom }
 ///    「整形中のキャンセル」にも適用する回帰テスト)
 @MainActor
 final class CoordinatorFormattingTests: XCTestCase {
-    override func setUp() {
-        super.setUp()
-        // 既定値(true)に依存するテストと明示的にfalseにするテストが混在するため、
-        // 各テストの冒頭で明示的に設定してからテストを実行し、後始末で削除する。
-    }
-
     override func tearDown() {
         UserDefaults.standard.removeObject(forKey: SettingsKey.formattingEnabled)
         super.tearDown()
@@ -120,12 +158,10 @@ final class CoordinatorFormattingTests: XCTestCase {
         let transcriptionEngine = ImmediateTranscriptionEngine(text: "えーっと、こんにちは")
         let formatter = FixedTextFormatter(outcome: .success("こんにちは。"))
         let clock = FakeClock()
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter, now: clock.now)
+        let textInserter = FakeTextInserter()
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter, textInserter: textInserter, now: clock.now)
 
-        var insertedResults: [String] = []
-        coordinator.onTranscriptionResult = { text, _ in insertedResults.append(text) }
-
-        coordinator.beginPushToTalk()
+        await coordinator.beginPushToTalk()
         coordinator.endPushToTalk()
         coordinator.audioCaptureEngine(audioEngine, didFinishRecording: nonSilentDummySamples, sampleRate: 16000)
 
@@ -133,7 +169,7 @@ final class CoordinatorFormattingTests: XCTestCase {
             await Task.yield()
         }
 
-        XCTAssertEqual(insertedResults, ["こんにちは。"])
+        XCTAssertEqual(textInserter.insertedTexts, ["こんにちは。"])
     }
 
     func testRawTextIsUsedWhenFormattingFails() async {
@@ -142,14 +178,13 @@ final class CoordinatorFormattingTests: XCTestCase {
         let transcriptionEngine = ImmediateTranscriptionEngine(text: "生の文字起こし結果")
         let formatter = FixedTextFormatter(outcome: .failure(FakeFormatterError.boom))
         let clock = FakeClock()
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter, now: clock.now)
+        let textInserter = FakeTextInserter()
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter, textInserter: textInserter, now: clock.now)
 
-        var insertedResults: [String] = []
-        coordinator.onTranscriptionResult = { text, _ in insertedResults.append(text) }
         var formattingFailedMessages: [String] = []
         coordinator.onFormattingFailed = { formattingFailedMessages.append($0) }
 
-        coordinator.beginPushToTalk()
+        await coordinator.beginPushToTalk()
         coordinator.endPushToTalk()
         coordinator.audioCaptureEngine(audioEngine, didFinishRecording: nonSilentDummySamples, sampleRate: 16000)
 
@@ -157,7 +192,7 @@ final class CoordinatorFormattingTests: XCTestCase {
             await Task.yield()
         }
 
-        XCTAssertEqual(insertedResults, ["生の文字起こし結果"], "整形失敗時は原文へフォールバックするべき")
+        XCTAssertEqual(textInserter.insertedTexts, ["生の文字起こし結果"], "整形失敗時は原文へフォールバックするべき")
         XCTAssertEqual(formattingFailedMessages.count, 1, "整形失敗時はonFormattingFailedが1回呼ばれるべき")
     }
 
@@ -168,14 +203,13 @@ final class CoordinatorFormattingTests: XCTestCase {
         // 呼ばれたら即座に失敗する(=呼ばれないことを期待する)フォーマッタ。
         let formatter = FixedTextFormatter(outcome: .failure(FakeFormatterError.boom))
         let clock = FakeClock()
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter, now: clock.now)
+        let textInserter = FakeTextInserter()
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter, textInserter: textInserter, now: clock.now)
 
-        var insertedResults: [String] = []
-        coordinator.onTranscriptionResult = { text, _ in insertedResults.append(text) }
         var formattingFailedCount = 0
         coordinator.onFormattingFailed = { _ in formattingFailedCount += 1 }
 
-        coordinator.beginPushToTalk()
+        await coordinator.beginPushToTalk()
         coordinator.endPushToTalk()
         coordinator.audioCaptureEngine(audioEngine, didFinishRecording: nonSilentDummySamples, sampleRate: 16000)
 
@@ -183,7 +217,7 @@ final class CoordinatorFormattingTests: XCTestCase {
             await Task.yield()
         }
 
-        XCTAssertEqual(insertedResults, ["生の文字起こし結果"])
+        XCTAssertEqual(textInserter.insertedTexts, ["生の文字起こし結果"])
         XCTAssertEqual(formattingFailedCount, 0, "整形が無効な場合はonFormattingFailedも呼ばれないべき")
     }
 
@@ -196,12 +230,10 @@ final class CoordinatorFormattingTests: XCTestCase {
         let transcriptionEngine = ImmediateTranscriptionEngine(text: "こんにちは")
         let formatter = ControllableTextFormatter()
         let clock = FakeClock()
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter, now: clock.now)
+        let textInserter = FakeTextInserter()
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter, textInserter: textInserter, now: clock.now)
 
-        var insertedResults: [String] = []
-        coordinator.onTranscriptionResult = { text, _ in insertedResults.append(text) }
-
-        coordinator.beginPushToTalk()
+        await coordinator.beginPushToTalk()
         coordinator.endPushToTalk()
         XCTAssertEqual(coordinator.state, .transcribing)
 
@@ -223,25 +255,30 @@ final class CoordinatorFormattingTests: XCTestCase {
 
         XCTAssertEqual(coordinator.state, .idle)
         XCTAssertTrue(
-            insertedResults.isEmpty,
+            textInserter.insertedTexts.isEmpty,
             "整形実行中にキャンセルされた場合、結果は挿入されず破棄されるべき"
         )
     }
 
-    /// 語彙ヒント(`Settings.sttVocabularyHint`)がフォーマッタへそのまま伝播することを確認する。
-    func testVocabularyHintIsPassedToFormatter() async {
+    /// 語彙ヒント(`Settings.sttVocabularyHint`)・整形モデル(`Settings.formattingModel`)が、
+    /// ジョブの設定スナップショット経由でフォーマッタへそのまま伝播することを確認する。
+    func testVocabularyHintAndModelArePassedToFormatterViaJobSnapshot() async {
         Settings.formattingEnabled = true
         let originalHint = Settings.sttVocabularyHint
         Settings.sttVocabularyHint = "Voicewriter, TestHint"
         defer { Settings.sttVocabularyHint = originalHint }
+        let originalModel = Settings.formattingModel
+        Settings.formattingModel = "test-model:1b"
+        defer { Settings.formattingModel = originalModel }
 
         let audioEngine = FakeAudioCaptureEngine()
         let transcriptionEngine = ImmediateTranscriptionEngine(text: "テスト")
         let formatter = ControllableTextFormatter()
         let clock = FakeClock()
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter, now: clock.now)
+        let textInserter = FakeTextInserter()
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter, textInserter: textInserter, now: clock.now)
 
-        coordinator.beginPushToTalk()
+        await coordinator.beginPushToTalk()
         coordinator.endPushToTalk()
         coordinator.audioCaptureEngine(audioEngine, didFinishRecording: nonSilentDummySamples, sampleRate: 16000)
 
@@ -253,7 +290,87 @@ final class CoordinatorFormattingTests: XCTestCase {
         }
 
         let hint = await formatter.lastVocabularyHint
+        let model = await formatter.lastModel
         XCTAssertEqual(hint, "Voicewriter, TestHint")
+        XCTAssertEqual(model, "test-model:1b")
+    }
+
+    /// Codexレビュー指摘#8の回帰テスト: 整形タイムアウト秒数もジョブの録音時点の設定スナップショット
+    /// に含まれ、待ち行列中に設定画面から変更されても、既に録音済みのジョブには影響しないべき
+    /// (以前は`OllamaFormatter`が実行時に毎回`Settings.formattingTimeoutSeconds`を直接読んでいた)。
+    func testFormattingTimeoutSnapshotIsCapturedAtRecordingStartAndNotAffectedByLaterSettingChange() async {
+        Settings.formattingEnabled = true
+        let originalTimeout = Settings.formattingTimeoutSeconds
+        Settings.formattingTimeoutSeconds = 12
+        defer { Settings.formattingTimeoutSeconds = originalTimeout }
+
+        let audioEngine = FakeAudioCaptureEngine()
+        let transcriptionEngine = ImmediateTranscriptionEngine(text: "テスト")
+        let formatter = ControllableTextFormatter()
+        let clock = FakeClock()
+        let textInserter = FakeTextInserter()
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter, textInserter: textInserter, now: clock.now)
+
+        await coordinator.beginPushToTalk()
+        // 録音中に設定を変更する(待ち行列中の設定変更を模す)。
+        Settings.formattingTimeoutSeconds = 3
+        coordinator.endPushToTalk()
+        coordinator.audioCaptureEngine(audioEngine, didFinishRecording: nonSilentDummySamples, sampleRate: 16000)
+
+        await formatter.waitUntilFormatStarted()
+        await formatter.resume(with: .success("テスト。"))
+
+        for _ in 0..<200 where coordinator.state != .idle {
+            await Task.yield()
+        }
+
+        let timeout = await formatter.lastTimeoutSeconds
+        XCTAssertEqual(timeout, 12, "録音開始時点のタイムアウト設定スナップショットが使われるべき")
+    }
+
+    /// Codexレビュー指摘#6の回帰テスト: Escによるキャンセルは、Registryのフラグを立てるだけでなく、
+    /// 実行中の整形タスク(実際にはOllamaへのURLSessionリクエスト)自体を`Task.cancel()`で
+    /// 中断させ、FIFOの先頭を即座に解放するべき。またキャンセル起因のエラーでは
+    /// `onFormattingFailed`(「整形失敗」警告)を出すべきではない。
+    func testCancelActuallyInterruptsFormattingTaskAndDoesNotReportFormattingFailedWarning() async {
+        Settings.formattingEnabled = true
+        let audioEngine = FakeAudioCaptureEngine()
+        let transcriptionEngine = ImmediateTranscriptionEngine(text: "こんにちは")
+        let formatter = CancellationAwareTextFormatter()
+        let clock = FakeClock()
+        let textInserter = FakeTextInserter()
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter, textInserter: textInserter, now: clock.now)
+
+        var committed: [DictationJobCommitEvent] = []
+        coordinator.onJobCommitted = { _, result in committed.append(result) }
+        var formattingFailedMessages: [String] = []
+        coordinator.onFormattingFailed = { formattingFailedMessages.append($0) }
+
+        await coordinator.beginPushToTalk()
+        coordinator.endPushToTalk()
+        coordinator.audioCaptureEngine(audioEngine, didFinishRecording: nonSilentDummySamples, sampleRate: 16000)
+
+        await formatter.waitUntilFormatStarted()
+
+        // Esc(非録音時キャンセル、まだ挿入されていない最新の未終端ジョブが対象)。
+        coordinator.cancelRecording()
+
+        // 実際にキャンセルハンドル(Task.cancel())が呼ばれ、フェイク整形処理が中断されて
+        // 短時間で終端することを確認する(以前はフラグを立てるだけで実行中のタスクは解放されず、
+        // FIFOの先頭を占有し続けていた)。
+        for _ in 0..<200 where coordinator.state != .idle {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+
+        XCTAssertEqual(coordinator.state, .idle, "キャンセルされた整形タスクが実際に中断され、短時間でidleへ戻るべき")
+        XCTAssertTrue(textInserter.insertedTexts.isEmpty)
+        XCTAssertEqual(committed.count, 1)
+        if case .cancelled = committed.first {
+            // expected
+        } else {
+            XCTFail("Expected .cancelled, got \(String(describing: committed.first))")
+        }
+        XCTAssertTrue(formattingFailedMessages.isEmpty, "キャンセル起因のエラーでは「整形失敗」警告を出すべきではない")
     }
 
     /// HUD表示用の`onPhaseChanged`が、整形が実際に行われる場合は
@@ -264,12 +381,13 @@ final class CoordinatorFormattingTests: XCTestCase {
         let transcriptionEngine = ImmediateTranscriptionEngine(text: "こんにちは")
         let formatter = FixedTextFormatter(outcome: .success("こんにちは。"))
         let clock = FakeClock()
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter, now: clock.now)
+        let textInserter = FakeTextInserter()
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter, textInserter: textInserter, now: clock.now)
 
         var phases: [TranscriptionPhase] = []
         coordinator.onPhaseChanged = { phases.append($0) }
 
-        coordinator.beginPushToTalk()
+        await coordinator.beginPushToTalk()
         coordinator.endPushToTalk()
         coordinator.audioCaptureEngine(audioEngine, didFinishRecording: nonSilentDummySamples, sampleRate: 16000)
 
@@ -287,12 +405,13 @@ final class CoordinatorFormattingTests: XCTestCase {
         let transcriptionEngine = ImmediateTranscriptionEngine(text: "こんにちは")
         let formatter = FixedTextFormatter(outcome: .failure(FakeFormatterError.boom))
         let clock = FakeClock()
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter, now: clock.now)
+        let textInserter = FakeTextInserter()
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter, textInserter: textInserter, now: clock.now)
 
         var phases: [TranscriptionPhase] = []
         coordinator.onPhaseChanged = { phases.append($0) }
 
-        coordinator.beginPushToTalk()
+        await coordinator.beginPushToTalk()
         coordinator.endPushToTalk()
         coordinator.audioCaptureEngine(audioEngine, didFinishRecording: nonSilentDummySamples, sampleRate: 16000)
 

@@ -25,7 +25,6 @@ enum WhisperCppEngineError: Error, CustomStringConvertible {
 final class WhisperCppEngine: TranscriptionEngine, @unchecked Sendable {
     private let log = Logger(subsystem: "dev.voicewriter.app", category: "WhisperCppEngine")
     private let context: OpaquePointer
-    private let language: String
     private let queue = DispatchQueue(label: "dev.voicewriter.whispercpp", qos: .userInitiated)
 
     /// モデル配置ディレクトリ (~/Library/Application Support/Voicewriter/models)
@@ -73,8 +72,7 @@ final class WhisperCppEngine: TranscriptionEngine, @unchecked Sendable {
 
     /// - Parameters:
     ///   - modelURL: ggml-large-v3-turbo.bin 等、ggml形式モデルのパス
-    ///   - language: "ja" 等のISO 639-1言語コード、または自動判定の "auto"
-    init(modelURL: URL, language: String) throws {
+    init(modelURL: URL) throws {
         guard FileManager.default.fileExists(atPath: modelURL.path) else {
             throw WhisperCppEngineError.modelNotFound(modelURL.path)
         }
@@ -86,18 +84,17 @@ final class WhisperCppEngine: TranscriptionEngine, @unchecked Sendable {
             throw WhisperCppEngineError.modelLoadFailed(modelURL.path)
         }
         self.context = ctx
-        self.language = language
 
         let versionCString = whisper_version()
         let version = versionCString.map { String(cString: $0) } ?? "unknown"
-        log.info("whisper.cpp model loaded from \(modelURL.path, privacy: .public) (whisper.cpp \(version, privacy: .public), language=\(language, privacy: .public))")
+        log.info("whisper.cpp model loaded from \(modelURL.path, privacy: .public) (whisper.cpp \(version, privacy: .public))")
     }
 
     deinit {
         whisper_free(context)
     }
 
-    func transcribe(samples: [Float], sampleRate: Double) async throws -> String {
+    func transcribe(samples: [Float], sampleRate: Double, language: String, vocabularyHint: String, vadEnabled: Bool) async throws -> String {
         guard !samples.isEmpty else {
             throw TranscriptionError.emptyAudio
         }
@@ -112,7 +109,7 @@ final class WhisperCppEngine: TranscriptionEngine, @unchecked Sendable {
                     return
                 }
                 do {
-                    let text = try self.runFull(samples: samples)
+                    let text = try self.runFull(samples: samples, language: language, vocabularyHint: vocabularyHint, vadEnabled: vadEnabled)
                     continuation.resume(returning: text)
                 } catch {
                     continuation.resume(throwing: error)
@@ -122,7 +119,7 @@ final class WhisperCppEngine: TranscriptionEngine, @unchecked Sendable {
     }
 
     /// 呼び出し元の`queue`上でのみ実行すること(whisper_fullは同一コンテキストに対して非再入)。
-    private func runFull(samples: [Float]) throws -> String {
+    private func runFull(samples: [Float], language: String, vocabularyHint: String, vadEnabled: Bool) throws -> String {
         // AlwaysOnモードのプリロールに混入した発話前ノイズがハルシネーションを誘発しないよう、
         // 先頭の低エネルギー区間をトリムしてから渡す(AudioPreprocessing.swift参照)。
         let trimmedSamples = AudioPreprocessing.trimLeadingSilence(samples: samples, sampleRate: 16000)
@@ -188,10 +185,10 @@ final class WhisperCppEngine: TranscriptionEngine, @unchecked Sendable {
         let languageForWhisper: String? = (language == "auto") ? nil : language
 
         // 固有名詞・専門用語の認識精度向上のためのヒント(initial_prompt)。強制ではなくデコーダの
-        // 文脈として働く(Amicalの語彙ヒント機能を参考)。設定は呼び出しごとに読むため、
-        // エンジン再ロードなしで次回の文字起こしから反映される。
-        let vocabularyHint = Settings.sttVocabularyHint.trimmingCharacters(in: .whitespacesAndNewlines)
-        let promptForWhisper: String? = vocabularyHint.isEmpty ? nil : vocabularyHint
+        // 文脈として働く(Amicalの語彙ヒント機能を参考)。呼び出し元(ジョブの設定スナップショット)
+        // から渡されたものをそのまま使う(待ち行列中の設定変更の影響を受けないようにするため)。
+        let trimmedVocabularyHint = vocabularyHint.trimmingCharacters(in: .whitespacesAndNewlines)
+        let promptForWhisper: String? = trimmedVocabularyHint.isEmpty ? nil : trimmedVocabularyHint
 
         // ハルシネーション対策(多層防御)の第3層: VAD(Voice Activity Detection、既定ON)。
         // 有効化されておりモデルが配置済みの場合のみ使う。whisper.cpp v1.9.1で
@@ -199,10 +196,10 @@ final class WhisperCppEngine: TranscriptionEngine, @unchecked Sendable {
         // デコードすることで、発話区間が全く検出されなければ空文字を返す(=末尾/全体無音での
         // ハルシネーション、例: https://github.com/ggml-org/whisper.cpp/issues/1724 を軽減できる)。
         // 一次情報: https://github.com/ggml-org/whisper.cpp/blob/v1.9.1/README.md#voice-activity-detection-vad
-        let vadModelPath: String? = Settings.vadEnabled && Self.isVadModelAvailable()
+        let vadModelPath: String? = vadEnabled && Self.isVadModelAvailable()
             ? Self.defaultVadModelURL.path
             : nil
-        if Settings.vadEnabled, vadModelPath == nil {
+        if vadEnabled, vadModelPath == nil {
             // 既定ONに変更したため、モデル未配置環境では毎回警告が出て冗長になる。
             // アプリの寿命中に1回だけ出せば十分な情報のため、以後は抑制する。
             if !Self.hasWarnedMissingVadModel {

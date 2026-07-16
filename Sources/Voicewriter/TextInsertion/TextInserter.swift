@@ -5,6 +5,9 @@ import os.log
 enum TextInsertionError: Error, CustomStringConvertible {
     case accessibilityNotTrusted
     case eventCreationFailed
+    /// `sendCommandV()`送出直前の最終確認で、期待していたフロントモストアプリ(録音開始時点の
+    /// もの)と実際のフロントモストアプリが一致しなかった(Codexレビュー指摘#4)。
+    case focusChanged
 
     var description: String {
         switch self {
@@ -12,7 +15,36 @@ enum TextInsertionError: Error, CustomStringConvertible {
             return "accessibility permission not granted"
         case .eventCreationFailed:
             return "failed to create CGEvent for Cmd+V"
+        case .focusChanged:
+            return "frontmost app changed just before paste"
         }
+    }
+}
+
+/// `DeliveryCoordinator`が挿入を行うために必要な最小限のインターフェース。
+/// 実装は`TextInserter`(実際にCGEventでCmd+Vを合成する)だが、単体テストでは
+/// 実際のアクセシビリティ権限・キーイベント送出に依存しないフェイクに差し替えられるようにしている。
+protocol TextInserting: AnyObject {
+    /// - Parameters:
+    ///   - text: 挿入するテキスト。
+    ///   - expectedFrontmostProcessIdentifier: 録音開始時点のフロントモストアプリのPID。
+    ///     `DeliveryCoordinator`は挿入直前に一度フォーカスを比較しているが、そこから実際に
+    ///     `sendCommandV()`を送出するまでの間(このメソッド内で`await`を挟む)にユーザーが
+    ///     アプリを切り替えるTOCTOUが起こりうるため、送出直前にもう一度最終確認する
+    ///     (Codexレビュー指摘#4)。`nil`の場合は確認をスキップする。不一致の場合は
+    ///     `TextInsertionError.focusChanged`をthrowし、Cmd+V自体は送出しない。
+    ///   - onPasted: 実際にCmd+Vを送出した直後(ペーストボード復元待ちより前)に呼ばれる。
+    ///     呼び出しごとの引数として渡すこと(共有プロパティにすると、複数ジョブの挿入が
+    ///     重なった際にどのジョブの完了通知か混同しうるため。過去に共有プロパティ方式で
+    ///     この競合が実際に指摘されたことがある)。
+    func insert(text: String, expectedFrontmostProcessIdentifier: pid_t?, onPasted: @escaping () -> Void) async throws
+}
+
+extension TextInserting {
+    /// `expectedFrontmostProcessIdentifier`を省略した呼び出し用の便宜的なオーバーロード
+    /// (フォーカス確認が不要な呼び出し元向け。テストでの記述量削減にも使う)。
+    func insert(text: String, onPasted: @escaping () -> Void = {}) async throws {
+        try await insert(text: text, expectedFrontmostProcessIdentifier: nil, onPasted: onPasted)
     }
 }
 
@@ -25,33 +57,51 @@ enum TextInsertionError: Error, CustomStringConvertible {
 ///    変わっていない場合のみ元の内容を復元する
 ///    (待機中に他プロセスがペーストボードを書き換えていたら、それを壊さないため復元しない)
 @MainActor
-final class TextInserter {
+final class TextInserter: TextInserting {
     private let log = Logger(subsystem: "dev.voicewriter.app", category: "TextInserter")
 
     /// Cmd+V送出後、ペーストボードを復元するまでの待ち時間(秒)。
     /// ペースト先アプリがペーストボードを読み終えるのを待つための猶予。
     var restoreDelaySeconds: Double = 0.4
 
-    /// Cmd+Vを実際に送出した直後(ペーストボード復元待ちより前)に呼ばれる。
-    /// HUD/効果音等、「挿入完了」を示すためのフック。挿入処理自体のタイミング・ロジックには影響しない。
-    var onPasted: (() -> Void)?
+    private let isAccessibilityTrusted: () -> Bool
+    private let sendCommandV: () throws -> Void
+    /// 現在のフロントモストアプリのPIDを取得する。`sendCommandV()`送出直前の最終フォーカス確認
+    /// (Codexレビュー指摘#4)用に差し替え可能にしている(テスト用、既定は実際のAPI)。
+    private let currentFrontmostProcessIdentifier: () -> pid_t?
 
-    /// `insert(text:)`は内部で`Task.sleep`を挟むため、呼び出しが重なるとスナップショットの
-    /// 保存・復元が競合しうる。直列化するため、前回呼び出しの完了を待ってから実行する。
+    /// `insert(text:expectedFrontmostProcessIdentifier:onPasted:)`は内部で`Task.sleep`を挟むため、
+    /// 呼び出しが重なるとスナップショットの保存・復元が競合しうる。直列化するため、前回呼び出しの
+    /// 完了を待ってから実行する。
     private var pendingTask: Task<Void, Error>?
 
-    func insert(text: String) async throws {
+    /// - Parameters:
+    ///   - isAccessibilityTrusted: アクセシビリティ権限確認の差し替え用(テスト用、既定は実際のAPI)。
+    ///   - sendCommandV: 実際のCmd+V送出処理の差し替え用(テスト用、既定は実際にCGEventを送出する)。
+    ///   - currentFrontmostProcessIdentifier: フォーカス最終確認用のフロントモストアプリPID取得の
+    ///     差し替え用(テスト用、既定は実際のAPI)。
+    init(
+        isAccessibilityTrusted: @escaping () -> Bool = { AccessibilityPermission.isTrusted },
+        sendCommandV: (() throws -> Void)? = nil,
+        currentFrontmostProcessIdentifier: @escaping () -> pid_t? = { NSWorkspace.shared.frontmostApplication?.processIdentifier }
+    ) {
+        self.isAccessibilityTrusted = isAccessibilityTrusted
+        self.sendCommandV = sendCommandV ?? Self.postCommandV
+        self.currentFrontmostProcessIdentifier = currentFrontmostProcessIdentifier
+    }
+
+    func insert(text: String, expectedFrontmostProcessIdentifier: pid_t?, onPasted: @escaping () -> Void) async throws {
         let previous = pendingTask
         let task = Task { @MainActor [weak self] in
             _ = try? await previous?.value
-            try await self?.performInsert(text: text)
+            try await self?.performInsert(text: text, expectedFrontmostProcessIdentifier: expectedFrontmostProcessIdentifier, onPasted: onPasted)
         }
         pendingTask = task
         try await task.value
     }
 
-    private func performInsert(text: String) async throws {
-        guard AccessibilityPermission.isTrusted else {
+    private func performInsert(text: String, expectedFrontmostProcessIdentifier: pid_t?, onPasted: @escaping () -> Void) async throws {
+        guard isAccessibilityTrusted() else {
             log.warning("Cannot insert text: accessibility permission not trusted")
             throw TextInsertionError.accessibilityNotTrusted
         }
@@ -64,14 +114,23 @@ final class TextInserter {
         pasteboard.setString(text, forType: .string)
         let ourChangeCount = pasteboard.changeCount
 
+        // sendCommandV()送出直前の最終フォーカス確認(Codexレビュー指摘#4)。`DeliveryCoordinator`側の
+        // 確認からここまでの間(pendingTaskの直列化待ちを含む)にユーザーがアプリを切り替える
+        // TOCTOUが起こりうるため、実際にCmd+Vを送出する直前にもう一度確認する。
+        if let expectedFrontmostProcessIdentifier, currentFrontmostProcessIdentifier() != expectedFrontmostProcessIdentifier {
+            // ペーストボードは書き換え済みのため、送出せずに元へ戻す。
+            snapshot.restore(to: pasteboard)
+            throw TextInsertionError.focusChanged
+        }
+
         do {
-            try postCommandV()
+            try sendCommandV()
         } catch {
             // ペースト送出に失敗した場合は復元まで待たず即座に元へ戻す
             snapshot.restore(to: pasteboard)
             throw error
         }
-        onPasted?()
+        onPasted()
 
         try? await Task.sleep(nanoseconds: UInt64(max(0, restoreDelaySeconds) * 1_000_000_000))
 
@@ -83,7 +142,7 @@ final class TextInserter {
         }
     }
 
-    private func postCommandV() throws {
+    private static func postCommandV() throws {
         let vKeyCode = Self.resolveVKeyCode()
         guard let source = CGEventSource(stateID: .combinedSessionState),
               let keyDown = CGEvent(keyboardEventSource: source, virtualKey: vKeyCode, keyDown: true),

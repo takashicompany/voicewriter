@@ -64,9 +64,9 @@ final class DynamicTranscriptionEngine: TranscriptionEngine, ObservableObject, @
         }
     }
 
-    func transcribe(samples: [Float], sampleRate: Double) async throws -> String {
+    func transcribe(samples: [Float], sampleRate: Double, language: String, vocabularyHint: String, vadEnabled: Bool) async throws -> String {
         let current = currentEngineSynchronized()
-        return try await current.transcribe(samples: samples, sampleRate: sampleRate)
+        return try await current.transcribe(samples: samples, sampleRate: sampleRate, language: language, vocabularyHint: vocabularyHint, vadEnabled: vadEnabled)
     }
 
     /// asyncコンテキストから直接NSLockを呼ばないよう、同期関数越しにロックする。
@@ -100,7 +100,7 @@ final class DynamicTranscriptionEngine: TranscriptionEngine, ObservableObject, @
                 return (StubTranscriptionEngine(), message)
             }
             do {
-                let engine = try WhisperCppEngine(modelURL: modelURL, language: Settings.sttLanguage)
+                let engine = try WhisperCppEngine(modelURL: modelURL)
                 return (engine, nil)
             } catch {
                 let message = "whisper.cppモデルの読み込みに失敗したため、スタブ文字起こしで動作しています: \(error)"

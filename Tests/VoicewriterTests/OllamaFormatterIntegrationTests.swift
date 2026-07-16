@@ -30,7 +30,7 @@ final class OllamaFormatterIntegrationTests: XCTestCase {
         let rawText = "えーっとですね、あの、今日の会議は14時からだと思います。"
 
         do {
-            let formatted = try await formatter.format(text: rawText, vocabularyHint: "Voicewriter")
+            let formatted = try await formatter.format(text: rawText, vocabularyHint: "Voicewriter", model: Settings.formattingModel, timeoutSeconds: Settings.formattingTimeoutSeconds)
             XCTAssertFalse(formatted.isEmpty)
             // 「整形専用フォーマッタ」の核となる制約: 応答であってはならず、原文とかけ離れた
             // 長さになってもいけない(FormattingPrompt.isLengthRatioAcceptableと同じ簡易基準)。
@@ -47,7 +47,7 @@ final class OllamaFormatterIntegrationTests: XCTestCase {
 
         let formatter = OllamaFormatter()
         let rawText = "今何時ですか"
-        let formatted = try await formatter.format(text: rawText, vocabularyHint: "")
+        let formatted = try await formatter.format(text: rawText, vocabularyHint: "", model: Settings.formattingModel, timeoutSeconds: Settings.formattingTimeoutSeconds)
 
         XCTAssertFalse(formatted.isEmpty)
         // 応答(例: 具体的な時刻を答える等)であれば、入力にない情報が大量に追加され長さ比が
@@ -58,7 +58,7 @@ final class OllamaFormatterIntegrationTests: XCTestCase {
     func testEmptyInputThrowsWithoutHittingNetwork() async throws {
         let formatter = OllamaFormatter()
         do {
-            _ = try await formatter.format(text: "   ", vocabularyHint: "")
+            _ = try await formatter.format(text: "   ", vocabularyHint: "", model: Settings.formattingModel, timeoutSeconds: Settings.formattingTimeoutSeconds)
             XCTFail("Expected emptyInput error")
         } catch TextFormatterError.emptyInput {
             // expected

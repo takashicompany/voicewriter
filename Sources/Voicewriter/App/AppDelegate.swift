@@ -8,15 +8,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusBarController: StatusBarController?
     private var coordinator: Coordinator?
     private var hotkeyManager: HotkeyManager?
-    private var textInserter: TextInserter?
     private var settingsWindowController: SettingsWindowController?
     private var statusHUDController: StatusHUDController?
     private var lastEngineWarning: String?
     private let audioEngine = AudioCaptureEngine()
-    /// 直近の文字起こしサイクルでLLM整形が失敗し、原文へフォールバックしたかどうか。
-    /// `onFormattingFailed`でtrueにし、`onTranscriptionResult`で読み取ってからリセットする
-    /// (HUDに「整形なしで挿入」を出し分けるための付加情報。状態機械のロジックには影響しない)。
-    private var formattingFellBackForPendingResult = false
+    /// `Coordinator.onPendingJobCountChanged`から更新する直近の未終端ジョブ数。
+    /// `applicationWillTerminate`が終了時のログ出力に使う(Codexレビュー指摘#11)。
+    private var lastKnownPendingJobCount = 0
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // LSUIElement=trueに加え、swift run等バンドル化されていない実行でもDockに出さないよう明示する
@@ -26,14 +24,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let transcriptionEngine = DynamicTranscriptionEngine()
         let textFormatter = OllamaFormatter()
+        let textInserter = TextInserter()
 
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: textFormatter)
+        let coordinator = Coordinator(
+            audioEngine: audioEngine,
+            transcriptionEngine: transcriptionEngine,
+            textFormatter: textFormatter,
+            textInserter: textInserter
+        )
         self.coordinator = coordinator
-        let statusBarController = StatusBarController(coordinator: coordinator) { [weak self] in
-            Task { @MainActor in
-                self?.showSettingsWindow(transcriptionEngine: transcriptionEngine)
+        let statusBarController = StatusBarController(
+            coordinator: coordinator,
+            onOpenSettings: { [weak self] in
+                Task { @MainActor in
+                    self?.showSettingsWindow(transcriptionEngine: transcriptionEngine)
+                }
+            },
+            onCancelAllJobs: { [weak coordinator] in
+                coordinator?.cancelAllJobs()
             }
-        }
+        )
         self.statusBarController = statusBarController
         self.hotkeyManager = HotkeyManager(coordinator: coordinator)
         // HotkeyManagerの構築(ハンドラ登録)がキャンセルショートカットを再度有効化してしまうため、
@@ -57,8 +67,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         coordinator.onPhaseChanged = { [weak statusHUDController] phase in
             statusHUDController?.handlePhaseChanged(phase)
         }
-        coordinator.onRecordingSkipped = { [weak statusHUDController] reason in
-            statusHUDController?.reportRecordingSkipped(reason)
+        coordinator.onPendingJobCountChanged = { [weak self, weak statusHUDController] count in
+            self?.lastKnownPendingJobCount = count
+            statusHUDController?.handlePendingJobCountChanged(count)
         }
         audioEngine.onLevelUpdate = { [weak statusHUDController] rms in
             statusHUDController?.updateLevel(rms)
@@ -85,54 +96,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusBarController.addWarning(accessibilityWarning)
         }
 
-        let textInserter = TextInserter()
-        self.textInserter = textInserter
-        coordinator.onTranscriptionResult = { [weak self, weak statusHUDController] text, recordingFrontmostApp in
-            Task { @MainActor in
-                guard let self else { return }
-                statusBarController.updateLastResult(text)
-
-                // このサイクルでLLM整形がフォールバックしていたかどうか(HUDの「整形なしで挿入」表示用)。
-                // 読み取り次第リセットし、次サイクルへ持ち越さない。
-                let usedFormattingFallback = self.formattingFellBackForPendingResult
-                self.formattingFellBackForPendingResult = false
-
-                // 挿入先フォーカスのガード: 録音開始時点のフロントモストアプリと、
-                // 挿入直前のフロントモストアプリが異なる場合は自動挿入を中止する
-                // (誤って別アプリへ挿入してしまうことを防ぐため)。結果はメニューバーの
-                // 「最後の文字起こし結果をコピー」から回収できる。
-                let currentFrontmost = NSWorkspace.shared.frontmostApplication
-                if let recordingFrontmostApp,
-                   currentFrontmost?.processIdentifier != recordingFrontmostApp.processIdentifier {
-                    self.log.warning("Frontmost app changed since recording started (from=\(recordingFrontmostApp.bundleIdentifier ?? "?", privacy: .public), to=\(currentFrontmost?.bundleIdentifier ?? "?", privacy: .public)); skipping auto-insert")
-                    let message = "挿入先アプリが録音中に切り替わったため、自動挿入を中止しました。メニューバーの「最後の文字起こし結果をコピー」から取得できます。"
-                    statusBarController.addWarning(message)
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak statusBarController] in
-                        statusBarController?.removeWarning(message)
-                    }
-                    return
+        // ジョブのコミット結果(挿入完了/スキップ/キャンセル/失敗/フォーカス不一致)の配線。
+        // 発話順(sequence)を厳守して`DeliveryCoordinator`が確定させた結果を、HUD/メニューバー/
+        // 効果音へ反映するだけで、挿入自体のロジック(フォーカス確認・Cmd+V送出)には一切関与しない。
+        coordinator.onJobCommitted = { [weak statusHUDController, weak statusBarController] sequence, result in
+            statusHUDController?.reportJobCommitted(result)
+            switch result {
+            case .inserted(let text, _):
+                statusBarController?.recordHistory(sequence: sequence, text: text)
+                SoundEffects.playInsertionCompleted()
+            case .focusMismatch(let text):
+                statusBarController?.recordHistory(sequence: sequence, text: text)
+                let message = "挿入先アプリが録音中に切り替わったため、自動挿入を中止しました。メニューバーの「最近の文字起こし結果」から取得できます。"
+                statusBarController?.addWarning(message)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak statusBarController] in
+                    statusBarController?.removeWarning(message)
                 }
-
-                // 実際にCmd+Vを送出した直後(=挿入完了とみなせるタイミング)にHUD/効果音を鳴らす。
-                textInserter.onPasted = { [weak statusHUDController] in
-                    statusHUDController?.reportInsertionSucceeded(usedFormattingFallback: usedFormattingFallback)
-                    SoundEffects.playInsertionCompleted()
+            case .failed(let error):
+                if case .some(TextInsertionError.accessibilityNotTrusted) = error {
+                    statusBarController?.addWarning(accessibilityWarning)
                 }
-
-                do {
-                    try await textInserter.insert(text: text)
-                } catch {
-                    self.log.error("Text insertion failed: \(String(describing: error), privacy: .public)")
-                    if case TextInsertionError.accessibilityNotTrusted = error {
-                        statusBarController.addWarning(accessibilityWarning)
-                    }
-                }
+            case .skipped, .cancelled:
+                break
             }
         }
 
-        coordinator.onBusyRecordingAttempt = {
-            // 文字起こし中に録音操作が要求された(最低限のフィードバック。キューイングまでは行わない)
+        coordinator.onQueueFull = { [weak statusHUDController] in
+            // 処理が追いついていない(未終端ジョブが上限に達した)ため新規録音を拒否した。
+            // 通常のビープと区別できるHUD表示を出す。
             NSSound.beep()
+            statusHUDController?.reportQueueFull()
         }
 
         coordinator.onFatalAudioError = { [weak statusBarController] message in
@@ -141,8 +134,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // LLM整形の失敗(Ollama未起動・タイムアウト等)は致命的ではない(原文へフォールバック済み)ため、
         // 一定時間で自動的に消える軽い警告として表示する(挿入先フォーカス変化時の警告と同じ方針)。
-        coordinator.onFormattingFailed = { [weak self, weak statusBarController] message in
-            self?.formattingFellBackForPendingResult = true
+        coordinator.onFormattingFailed = { [weak statusBarController] message in
             statusBarController?.addWarning(message)
             DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak statusBarController] in
                 statusBarController?.removeWarning(message)
@@ -170,8 +162,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 起動時にOllamaへ整形モデルの先読み(keep_alive:-1で常駐化)を依頼しておく。初回の実際の
         // 整形リクエストがモデルロード待ち(大型モデルだと数秒〜十数秒)でタイムアウトしないようにする
         // ための最適化で、失敗してもここでは無視してよい(その場合は通常通り初回リクエスト時にロードされる)。
+        // 推論用FIFO(`Coordinator.inferenceQueue`)経由で実行することで、起動直後にユーザーが
+        // すぐ話し始めた場合の初回whisper.cpp呼び出しと同時にGPU/Unified Memoryを奪い合わない
+        // ようにする(Codexレビュー指摘#12: 以前は`Task.detached`で完全に独立して実行しており、
+        // 初回の文字起こしと同時にOllamaのモデルロードが走ると両者が資源を奪い合ってしまっていた)。
         if Settings.formattingEnabled {
-            Task.detached(priority: .utility) {
+            coordinator.enqueueBackgroundInferenceTask {
                 await textFormatter.preload()
             }
         }
@@ -180,8 +176,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         log.info("Voicewriter launched. micMode=\(Settings.micMode.rawValue, privacy: .public) sttEngine=\(actualEngineName, privacy: .public) formattingEnabled=\(Settings.formattingEnabled, privacy: .public) formattingModel=\(Settings.formattingModel, privacy: .public)")
     }
 
+    /// 既知の制約(Codexレビュー指摘#11): 完全なドレイン(未終端ジョブ全ての処理・挿入完了を待つ)は
+    /// 行わない。挿入クリティカル区間(フォーカス確認〜Cmd+V送出、ペーストボード復元待ち)が
+    /// 進行中の場合のみ、最大1秒程度終了を遅らせて復元を完了させる(`NSApplicationDelegate`の
+    /// このメソッド自体は非同期を待てないため、`RunLoop`を短時間ポンプして待つ)。
+    /// それ以外の未終端ジョブ(認識・整形待ち、挿入待ち)は、そのまま終了する。件数はログに残す。
     func applicationWillTerminate(_ notification: Notification) {
         log.info("Voicewriter terminating")
+        guard let coordinator else { return }
+
+        if coordinator.isInsertionCriticalSection {
+            log.info("Delaying termination briefly to let clipboard restore complete")
+            let deadline = Date().addingTimeInterval(1.0)
+            while coordinator.isInsertionCriticalSection, Date() < deadline {
+                RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+            }
+        }
+
+        if lastKnownPendingJobCount > 0 {
+            log.warning("Terminating with \(self.lastKnownPendingJobCount, privacy: .public) unterminated job(s) still pending (not drained; see README known limitations)")
+        }
     }
 
     /// メニューバーの「設定...」から呼ばれる。ウィンドウが未生成なら生成し、前面化する。

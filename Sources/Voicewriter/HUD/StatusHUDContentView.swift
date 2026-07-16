@@ -1,11 +1,12 @@
 import SwiftUI
 
 /// superwhisper/Wispr Flow風の小さなピル型パネルの中身。
-/// ダーク寄りの半透明マテリアル・角丸ピル型・コンパクト(幅約200px)。
+/// ダーク寄りの半透明マテリアル・角丸ピル型・コンパクト(幅約224px、連続入力の残件数表示のため
+/// 従来より少しだけ幅を広げた)。
 struct StatusHUDContentView: View {
     @ObservedObject var viewModel: StatusHUDViewModel
 
-    static let panelSize = NSSize(width: 208, height: 40)
+    static let panelSize = NSSize(width: 224, height: 40)
 
     var body: some View {
         HStack(spacing: 8) {
@@ -15,8 +16,8 @@ struct StatusHUDContentView: View {
                 .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(.white)
                 .lineLimit(1)
-                .minimumScaleFactor(0.8)
-            if case .recording(let level) = viewModel.display {
+                .minimumScaleFactor(0.7)
+            if case .recording(let level, _) = viewModel.display {
                 Spacer(minLength: 4)
                 levelMeter(level: level)
             } else {
@@ -57,18 +58,30 @@ struct StatusHUDContentView: View {
         case .cancelled:
             Image(systemName: "mic.slash.fill")
                 .foregroundStyle(Color.white.opacity(0.7))
+        case .queueFull:
+            Image(systemName: "tray.full.fill")
+                .foregroundStyle(Color.orange)
         }
     }
 
     private var label: String {
         switch viewModel.display {
-        case .hidden: return ""
-        case .recording: return "録音中"
-        case .recognizing: return "認識中…"
-        case .formatting: return "整形中…"
-        case .success: return "挿入しました"
-        case .fallbackWarning: return "整形なしで挿入"
-        case .cancelled(let message): return message
+        case .hidden:
+            return ""
+        case .recording(_, let pendingCount):
+            return pendingCount > 0 ? "録音中 +\(pendingCount)件処理中" : "録音中"
+        case .recognizing(let pendingCount):
+            return pendingCount > 0 ? "認識中… 残り\(pendingCount)件" : "認識中…"
+        case .formatting(let pendingCount):
+            return pendingCount > 0 ? "整形中… 残り\(pendingCount)件" : "整形中…"
+        case .success:
+            return "挿入しました"
+        case .fallbackWarning:
+            return "整形なしで挿入"
+        case .cancelled(let message):
+            return message
+        case .queueFull:
+            return "処理が追いついていません"
         }
     }
 

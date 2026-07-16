@@ -12,7 +12,7 @@ final class StubTranscriptionEngine: TranscriptionEngine {
         return base.appendingPathComponent("Voicewriter/Recordings", isDirectory: true)
     }
 
-    func transcribe(samples: [Float], sampleRate: Double) async throws -> String {
+    func transcribe(samples: [Float], sampleRate: Double, language: String, vocabularyHint: String, vadEnabled: Bool) async throws -> String {
         guard !samples.isEmpty else {
             throw TranscriptionError.emptyAudio
         }

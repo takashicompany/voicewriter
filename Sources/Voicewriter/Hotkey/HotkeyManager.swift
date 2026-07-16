@@ -15,7 +15,7 @@ final class HotkeyManager {
         // PTT: keyDownで開始、keyUpで終了。
         KeyboardShortcuts.onKeyDown(for: .pushToTalk) { [weak self] in
             self?.log.debug("pushToTalk keyDown")
-            Task { @MainActor in self?.coordinator?.beginPushToTalk() }
+            Task { @MainActor in await self?.coordinator?.beginPushToTalk() }
         }
         KeyboardShortcuts.onKeyUp(for: .pushToTalk) { [weak self] in
             self?.log.debug("pushToTalk keyUp")
@@ -25,7 +25,7 @@ final class HotkeyManager {
         // トグル: keyUp(離した瞬間)のみで判定するため、キーリピートによる暴発が起きない。
         KeyboardShortcuts.onKeyUp(for: .toggleRecording) { [weak self] in
             self?.log.debug("toggleRecording keyUp")
-            Task { @MainActor in self?.coordinator?.toggleRecording() }
+            Task { @MainActor in await self?.coordinator?.toggleRecording() }
         }
 
         // 録音中のキャンセル

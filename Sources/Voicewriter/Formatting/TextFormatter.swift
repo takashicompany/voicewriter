@@ -12,9 +12,16 @@ protocol TextFormatter: Sendable {
     ///   - text: 整形対象のテキスト(whisper.cppの生出力)。
     ///   - vocabularyHint: `Settings.sttVocabularyHint`と同じ値を渡す想定の語彙ヒント
     ///     (固有名詞・専門用語のカンマ区切り)。空文字なら無視してよい。
+    ///   - model: 使用するOllamaモデル名。呼び出しごとに渡す(ジョブの録音時点の設定スナップショットを
+    ///     使うため。待ち行列中に設定画面からモデルが変更されても、既に録音済みのジョブは
+    ///     録音時点のモデルのまま処理されるべきため、実装側は`Settings.formattingModel`を
+    ///     直接読まずこの引数を使うこと)。
+    ///   - timeoutSeconds: リクエストのタイムアウト秒数。同様に呼び出しごとに渡す(実装側は
+    ///     `Settings.formattingTimeoutSeconds`を直接読まずこの引数を使うこと。Codexレビュー
+    ///     指摘#8: 待ち行列中の設定変更が既に録音済みのジョブにも影響してしまうのを防ぐため)。
     /// - Returns: 整形済みテキスト。
     /// - Throws: `TextFormatterError`(またはその他のエラー)。呼び出し側は必ず原文へフォールバックすること。
-    func format(text: String, vocabularyHint: String) async throws -> String
+    func format(text: String, vocabularyHint: String, model: String, timeoutSeconds: TimeInterval) async throws -> String
 }
 
 enum TextFormatterError: Error, CustomStringConvertible {
