@@ -73,11 +73,11 @@ enum Settings {
         }
     }
 
-    /// OnDemandモードで録音停止後、エンジンを止めるまでのアイドル秒数。デフォルト30秒。
+    /// OnDemandモードで録音停止後、エンジンを止めるまでのアイドル秒数。デフォルト5秒。
     static var onDemandIdleTimeoutSeconds: Double {
         get {
             let value = UserDefaults.standard.double(forKey: SettingsKey.onDemandIdleTimeoutSeconds)
-            return value > 0 ? value : 30.0
+            return value > 0 ? value : 5.0
         }
         set {
             UserDefaults.standard.set(newValue, forKey: SettingsKey.onDemandIdleTimeoutSeconds)

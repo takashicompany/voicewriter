@@ -213,7 +213,7 @@ tccutil reset Microphone dev.voicewriter.app
 
 メニューバーの「設定...」(⌘,)からSwiftUI製の設定ウィンドウを開けます。このアプリは`LSUIElement=true`(Dockアイコン無し)のため、ウィンドウを開くたびに`NSApp.activate` + `makeKeyAndOrderFront`で明示的に前面化しています(`Sources/Voicewriter/App/SettingsWindowController.swift`)。5つのタブで構成されます(`Sources/Voicewriter/Settings/`)。
 
-- **マイク**: マイクモード(常時オープン/必要時のみ)の切替、プリロール秒数(0〜2秒)、リングバッファ秒数のスライダー。マイクモードとリングバッファ秒数の変更は`AudioCaptureEngine`へ即座に反映されます(常時オープンへの切替はAVAudioEngineを起動、必要時のみへの切替は録音中でなければ即座にエンジンを停止)。
+- **マイク**: マイクモード(常時オープン/必要時のみ)の切替、プリロール秒数(0〜2秒、常時オープン時のみ有効)、リングバッファ秒数、マイクをオフにするまでの秒数(2〜30秒、必要時のみモード時のみ有効)のスライダー。マイクモードとリングバッファ秒数の変更は`AudioCaptureEngine`へ即座に反映されます(常時オープンへの切替はAVAudioEngineを起動、必要時のみへの切替は録音中でなければ即座にエンジンを停止)。
 - **ショートカット**: `KeyboardShortcuts.Recorder`でPush-to-Talk/トグル/キャンセルの割当を変更できます。変更はライブラリ側が自動的に永続化・グローバル監視へ反映します。
 - **音声認識**: エンジン(whisper.cpp/スタブ)と言語(`ja`/`auto`)の選択、認識のヒント(`initial_prompt`用の語彙ヒント、カンマ区切り)、モデルファイルの状態表示(配置済みならパスとサイズ、未配置ならダウンロードボタンで進捗付きダウンロードを実行可能)。エンジン/言語の変更は次回の文字起こしから反映されます(`Sources/Voicewriter/Transcription/DynamicTranscriptionEngine.swift`が内部エンジンを差し替える)。ヒントの変更はエンジン再ロード不要で次回の文字起こしから反映されます。
 - **整形**: LLM整形(下記「LLM整形パス」参照)のON/OFF、Ollamaモデル選択(`/api/tags`から動的取得)、タイムアウト秒数。
@@ -339,7 +339,7 @@ python3 scripts/benchmark-formatter.py
 | `micMode` | string (`alwaysOn`/`onDemand`) | `alwaysOn` | マイクの動作モード |
 | `ringBufferSeconds` | double | `3.0` | AlwaysOnモードで保持するリングバッファの秒数 |
 | `prerollSeconds` | double | `0.5` | 録音開始時に遡って含めるプリロール秒数 |
-| `onDemandIdleTimeoutSeconds` | double | `30.0` | OnDemandモードで録音停止後にエンジンを止めるまでのアイドル秒数 |
+| `onDemandIdleTimeoutSeconds` | double | `5.0` | OnDemandモードで録音停止後にエンジンを止めるまでのアイドル秒数 |
 | `sttEngine` | string (`whisperCpp`/`stub`) | `whisperCpp` | 文字起こしエンジン。モデル未配置/ロード失敗時は自動的にstub相当の動作にフォールバックする |
 | `sttLanguage` | string | `ja` | whisper.cppの言語設定。`auto`で自動判定 |
 | `sttVocabularyHint` | string | `Voicewriter` | whisper.cppの`initial_prompt`に渡す語彙ヒント(固有名詞・専門用語、カンマ区切り推奨)。空文字を明示的に設定するとヒント無し |

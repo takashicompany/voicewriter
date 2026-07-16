@@ -9,6 +9,7 @@ struct MicSettingsView: View {
     @AppStorage(SettingsKey.micMode) private var micMode: MicMode = .alwaysOn
     @AppStorage(SettingsKey.prerollSeconds) private var prerollSeconds: Double = 0.5
     @AppStorage(SettingsKey.ringBufferSeconds) private var ringBufferSeconds: Double = 3.0
+    @AppStorage(SettingsKey.onDemandIdleTimeoutSeconds) private var onDemandIdleTimeoutSeconds: Double = 5.0
 
     var body: some View {
         Form {
@@ -45,6 +46,15 @@ struct MicSettingsView: View {
                             audioEngine.applyRingBufferSecondsChange()
                         }
                     Text("常時オープン時に直近何秒分の音声を保持しておくか(プリロールの上限)。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("マイクオフまでの秒数: \(String(format: "%.0f", onDemandIdleTimeoutSeconds))秒")
+                    Slider(value: $onDemandIdleTimeoutSeconds, in: 2...30, step: 1)
+                        .disabled(micMode != .onDemand)
+                    Text("必要時のみモードで、録音終了後にマイクをオフにするまでのアイドル秒数です。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
