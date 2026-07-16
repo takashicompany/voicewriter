@@ -176,11 +176,15 @@ params.temperature_inc = 0.2
 params.entropy_thold = 2.4
 params.logprob_thold = -1.0
 
-// suppress_nst/no_speech_tholdはHandy(cjpais/transcribe-rs)の実運用値を採用(WhisperCppEngine.swift参照)。
+// suppress_nst=trueは維持。no_speech_tholdはwhisper-cli既定値の0.6に戻した
+// (WhisperCppEngine.swiftのコメント参照: whisper.cppソース上、no_speech_tholdは
+//  no_speech_prob > thold && avg_logprobs < logprob_tholdの複合条件でのみ効き、
+//  自信を持って生成されたハルシネーションには単独では効果がないため)。
 params.suppress_nst = true
-params.no_speech_thold = 0.2
+params.no_speech_thold = 0.6
 
-// VAD(既定OFF、VERIFY_WHISPER_VAD=1で有効化)。
+// VAD(既定OFF、VERIFY_WHISPER_VAD=1で有効化)。speech_pad_msはWhisperCppEngine.swiftと
+// 同じく100ms(既定30msから引き上げ、語頭・語尾の欠落を防ぐ安全マージン)。
 let vadModelPath = (NSHomeDirectory() as NSString)
     .appendingPathComponent("Library/Application Support/Voicewriter/models/ggml-silero-v5.1.2.bin")
 let vadModelPathForWhisper: String?
@@ -196,7 +200,9 @@ if vadOverride {
     vadModelPathForWhisper = nil
 }
 params.vad = (vadModelPathForWhisper != nil)
-params.vad_params = whisper_vad_default_params()
+var vadParamsForVerify = whisper_vad_default_params()
+vadParamsForVerify.speech_pad_ms = 100
+params.vad_params = vadParamsForVerify
 
 let languageForWhisper: String? = (language == "auto") ? nil : language
 
@@ -232,14 +238,28 @@ guard result == 0 else {
     fail("whisper_full failed with code \(result)")
 }
 
+// セグメント単位のno_speech_probフィルタ(WhisperCppEngine.swiftの`filterSegments`と同一ロジック、
+// 意図的な複製。VERIFY_WHISPER_NO_SPEECH_FILTER=0で無効化して比較できる)。
+let segmentNoSpeechFilterEnabled = (env["VERIFY_WHISPER_NO_SPEECH_FILTER"] ?? "1") != "0"
+let segmentNoSpeechProbThreshold: Float = 0.6
+
 let segmentCount = whisper_full_n_segments(ctx)
 var text = ""
+var excludedSegmentCount = 0
 for i in 0..<segmentCount {
-    if let cText = whisper_full_get_segment_text(ctx, i) {
-        text += String(cString: cText)
+    let segmentText = whisper_full_get_segment_text(ctx, i).map { String(cString: $0) } ?? ""
+    let noSpeechProb = whisper_full_get_segment_no_speech_prob(ctx, i)
+    if segmentNoSpeechFilterEnabled, noSpeechProb >= segmentNoSpeechProbThreshold {
+        excludedSegmentCount += 1
+        print("    segment \(i) excluded: no_speech_prob=\(String(format: "%.3f", noSpeechProb)) text=\(segmentText)")
+        continue
     }
+    text += segmentText
 }
 text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+if excludedSegmentCount > 0 {
+    print("    excluded \(excludedSegmentCount) of \(segmentCount) segment(s) with high no_speech_prob (threshold=\(segmentNoSpeechProbThreshold))")
+}
 
 let audioDurationSeconds = Double(rawSamples.count) / (sampleRate > 0 ? sampleRate : 16000)
 

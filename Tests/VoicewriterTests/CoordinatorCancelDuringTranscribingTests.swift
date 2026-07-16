@@ -14,6 +14,25 @@ private final class FakeAudioCaptureEngine: AudioCaptureEngineControlling {
     func cancelRecording() { cancelRecordingCallCount += 1 }
 }
 
+/// テスト用の単調増加フェイク時計。`beginPushToTalk()`〜`endPushToTalk()`はテスト内では
+/// 実時間ではなく同期的に(数マイクロ秒で)呼ばれるため、実時計のままだと
+/// ハルシネーション対策の第1層(最短録音時間ガード、既定0.3秒)に常に引っかかってしまう。
+/// 呼び出しごとに`step`秒ずつ進む値を返すことでこれを回避する
+/// (`Coordinator.minimumEffectiveRecordingDuration`自体は変更しない)。
+private final class FakeClock {
+    private var current = Date(timeIntervalSince1970: 1_700_000_000)
+    private let step: TimeInterval
+    init(step: TimeInterval = 1.0) { self.step = step }
+    func now() -> Date {
+        defer { current = current.addingTimeInterval(step) }
+        return current
+    }
+}
+
+/// ハルシネーション対策の第2層(エネルギーゲート)を通過させるためのダミー音声サンプル
+/// (無音ではなく、発話とみなせる程度の振幅を持つ)。
+private let nonSilentDummySamples: [Float] = Array(repeating: Float(0.3), count: 4800)
+
 /// テスト用のフェイク`TranscriptionEngine`。`transcribe(samples:sampleRate:)`の完了タイミングを
 /// テスト側から任意に制御できるようにし、「`await transcribe`実行中(=結果がまだ返っていない間)に
 /// キャンセルが要求される」状況を決定的に再現するために使う。
@@ -61,7 +80,8 @@ final class CoordinatorCancelDuringTranscribingTests: XCTestCase {
     func testCancelRequestedWhileTranscribeIsAwaitingIsNotIgnored() async {
         let audioEngine = FakeAudioCaptureEngine()
         let transcriptionEngine = ControllableTranscriptionEngine()
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine)
+        let clock = FakeClock()
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, now: clock.now)
 
         var insertedResults: [String] = []
         coordinator.onTranscriptionResult = { text, _ in insertedResults.append(text) }
@@ -71,7 +91,7 @@ final class CoordinatorCancelDuringTranscribingTests: XCTestCase {
         XCTAssertEqual(coordinator.state, .transcribing)
 
         // AudioCaptureEngineからの「録音終了、文字起こし開始」通知をシミュレートする。
-        coordinator.audioCaptureEngine(audioEngine, didFinishRecording: [0.0, 0.0], sampleRate: 16000)
+        coordinator.audioCaptureEngine(audioEngine, didFinishRecording: nonSilentDummySamples, sampleRate: 16000)
 
         // `transcribe()`がcontinuationで待機状態に入るまで、MainActor上の他のTaskに実行を譲る。
         await transcriptionEngine.waitUntilTranscribeStarted()
@@ -101,14 +121,15 @@ final class CoordinatorCancelDuringTranscribingTests: XCTestCase {
     func testResultIsInsertedWhenNotCancelled() async {
         let audioEngine = FakeAudioCaptureEngine()
         let transcriptionEngine = ControllableTranscriptionEngine()
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine)
+        let clock = FakeClock()
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, now: clock.now)
 
         var insertedResults: [String] = []
         coordinator.onTranscriptionResult = { text, _ in insertedResults.append(text) }
 
         coordinator.beginPushToTalk()
         coordinator.endPushToTalk()
-        coordinator.audioCaptureEngine(audioEngine, didFinishRecording: [0.0, 0.0], sampleRate: 16000)
+        coordinator.audioCaptureEngine(audioEngine, didFinishRecording: nonSilentDummySamples, sampleRate: 16000)
 
         await transcriptionEngine.waitUntilTranscribeStarted()
         await transcriptionEngine.resume(with: "こんにちは")

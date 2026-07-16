@@ -9,6 +9,22 @@ private final class FakeAudioCaptureEngine: AudioCaptureEngineControlling {
     func cancelRecording() {}
 }
 
+/// テスト用の単調増加フェイク時計(CoordinatorCancelDuringTranscribingTestsと同じ方針)。
+/// `beginPushToTalk()`〜`endPushToTalk()`が同期的に呼ばれるテストで、ハルシネーション対策の
+/// 第1層(最短録音時間ガード、既定0.3秒)に引っかからないようにするために使う。
+private final class FakeClock {
+    private var current = Date(timeIntervalSince1970: 1_700_000_000)
+    private let step: TimeInterval
+    init(step: TimeInterval = 1.0) { self.step = step }
+    func now() -> Date {
+        defer { current = current.addingTimeInterval(step) }
+        return current
+    }
+}
+
+/// ハルシネーション対策の第2層(エネルギーゲート)を通過させるためのダミー音声サンプル。
+private let nonSilentDummySamples: [Float] = Array(repeating: Float(0.3), count: 4800)
+
 /// テスト用のフェイク`TranscriptionEngine`。即座に固定テキストを返す。
 private final class ImmediateTranscriptionEngine: TranscriptionEngine {
     let text: String
@@ -103,14 +119,15 @@ final class CoordinatorFormattingTests: XCTestCase {
         let audioEngine = FakeAudioCaptureEngine()
         let transcriptionEngine = ImmediateTranscriptionEngine(text: "えーっと、こんにちは")
         let formatter = FixedTextFormatter(outcome: .success("こんにちは。"))
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter)
+        let clock = FakeClock()
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter, now: clock.now)
 
         var insertedResults: [String] = []
         coordinator.onTranscriptionResult = { text, _ in insertedResults.append(text) }
 
         coordinator.beginPushToTalk()
         coordinator.endPushToTalk()
-        coordinator.audioCaptureEngine(audioEngine, didFinishRecording: [0.0, 0.0], sampleRate: 16000)
+        coordinator.audioCaptureEngine(audioEngine, didFinishRecording: nonSilentDummySamples, sampleRate: 16000)
 
         for _ in 0..<200 where coordinator.state != .idle {
             await Task.yield()
@@ -124,7 +141,8 @@ final class CoordinatorFormattingTests: XCTestCase {
         let audioEngine = FakeAudioCaptureEngine()
         let transcriptionEngine = ImmediateTranscriptionEngine(text: "生の文字起こし結果")
         let formatter = FixedTextFormatter(outcome: .failure(FakeFormatterError.boom))
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter)
+        let clock = FakeClock()
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter, now: clock.now)
 
         var insertedResults: [String] = []
         coordinator.onTranscriptionResult = { text, _ in insertedResults.append(text) }
@@ -133,7 +151,7 @@ final class CoordinatorFormattingTests: XCTestCase {
 
         coordinator.beginPushToTalk()
         coordinator.endPushToTalk()
-        coordinator.audioCaptureEngine(audioEngine, didFinishRecording: [0.0, 0.0], sampleRate: 16000)
+        coordinator.audioCaptureEngine(audioEngine, didFinishRecording: nonSilentDummySamples, sampleRate: 16000)
 
         for _ in 0..<200 where coordinator.state != .idle {
             await Task.yield()
@@ -149,7 +167,8 @@ final class CoordinatorFormattingTests: XCTestCase {
         let transcriptionEngine = ImmediateTranscriptionEngine(text: "生の文字起こし結果")
         // 呼ばれたら即座に失敗する(=呼ばれないことを期待する)フォーマッタ。
         let formatter = FixedTextFormatter(outcome: .failure(FakeFormatterError.boom))
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter)
+        let clock = FakeClock()
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter, now: clock.now)
 
         var insertedResults: [String] = []
         coordinator.onTranscriptionResult = { text, _ in insertedResults.append(text) }
@@ -158,7 +177,7 @@ final class CoordinatorFormattingTests: XCTestCase {
 
         coordinator.beginPushToTalk()
         coordinator.endPushToTalk()
-        coordinator.audioCaptureEngine(audioEngine, didFinishRecording: [0.0, 0.0], sampleRate: 16000)
+        coordinator.audioCaptureEngine(audioEngine, didFinishRecording: nonSilentDummySamples, sampleRate: 16000)
 
         for _ in 0..<200 where coordinator.state != .idle {
             await Task.yield()
@@ -176,7 +195,8 @@ final class CoordinatorFormattingTests: XCTestCase {
         let audioEngine = FakeAudioCaptureEngine()
         let transcriptionEngine = ImmediateTranscriptionEngine(text: "こんにちは")
         let formatter = ControllableTextFormatter()
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter)
+        let clock = FakeClock()
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter, now: clock.now)
 
         var insertedResults: [String] = []
         coordinator.onTranscriptionResult = { text, _ in insertedResults.append(text) }
@@ -185,7 +205,7 @@ final class CoordinatorFormattingTests: XCTestCase {
         coordinator.endPushToTalk()
         XCTAssertEqual(coordinator.state, .transcribing)
 
-        coordinator.audioCaptureEngine(audioEngine, didFinishRecording: [0.0, 0.0], sampleRate: 16000)
+        coordinator.audioCaptureEngine(audioEngine, didFinishRecording: nonSilentDummySamples, sampleRate: 16000)
 
         // 整形(format())がcontinuationで待機状態に入るまで、MainActor上の他のTaskに実行を譲る。
         await formatter.waitUntilFormatStarted()
@@ -218,11 +238,12 @@ final class CoordinatorFormattingTests: XCTestCase {
         let audioEngine = FakeAudioCaptureEngine()
         let transcriptionEngine = ImmediateTranscriptionEngine(text: "テスト")
         let formatter = ControllableTextFormatter()
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter)
+        let clock = FakeClock()
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter, now: clock.now)
 
         coordinator.beginPushToTalk()
         coordinator.endPushToTalk()
-        coordinator.audioCaptureEngine(audioEngine, didFinishRecording: [0.0, 0.0], sampleRate: 16000)
+        coordinator.audioCaptureEngine(audioEngine, didFinishRecording: nonSilentDummySamples, sampleRate: 16000)
 
         await formatter.waitUntilFormatStarted()
         await formatter.resume(with: .success("テスト。"))
@@ -242,14 +263,15 @@ final class CoordinatorFormattingTests: XCTestCase {
         let audioEngine = FakeAudioCaptureEngine()
         let transcriptionEngine = ImmediateTranscriptionEngine(text: "こんにちは")
         let formatter = FixedTextFormatter(outcome: .success("こんにちは。"))
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter)
+        let clock = FakeClock()
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter, now: clock.now)
 
         var phases: [TranscriptionPhase] = []
         coordinator.onPhaseChanged = { phases.append($0) }
 
         coordinator.beginPushToTalk()
         coordinator.endPushToTalk()
-        coordinator.audioCaptureEngine(audioEngine, didFinishRecording: [0.0, 0.0], sampleRate: 16000)
+        coordinator.audioCaptureEngine(audioEngine, didFinishRecording: nonSilentDummySamples, sampleRate: 16000)
 
         for _ in 0..<200 where coordinator.state != .idle {
             await Task.yield()
@@ -264,14 +286,15 @@ final class CoordinatorFormattingTests: XCTestCase {
         let audioEngine = FakeAudioCaptureEngine()
         let transcriptionEngine = ImmediateTranscriptionEngine(text: "こんにちは")
         let formatter = FixedTextFormatter(outcome: .failure(FakeFormatterError.boom))
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter)
+        let clock = FakeClock()
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter, now: clock.now)
 
         var phases: [TranscriptionPhase] = []
         coordinator.onPhaseChanged = { phases.append($0) }
 
         coordinator.beginPushToTalk()
         coordinator.endPushToTalk()
-        coordinator.audioCaptureEngine(audioEngine, didFinishRecording: [0.0, 0.0], sampleRate: 16000)
+        coordinator.audioCaptureEngine(audioEngine, didFinishRecording: nonSilentDummySamples, sampleRate: 16000)
 
         for _ in 0..<200 where coordinator.state != .idle {
             await Task.yield()

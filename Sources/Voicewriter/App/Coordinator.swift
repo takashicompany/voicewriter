@@ -9,6 +9,17 @@ enum AppState {
     case transcribing
 }
 
+/// ハルシネーション対策(多層防御)により、文字起こし結果が得られず(または既知の
+/// ハルシネーション定型句のみと判定され)録音サイクルがスキップされた理由。
+/// HUD表示の出し分け専用の付加情報であり、状態機械のロジックには影響しない。
+enum RecordingSkipReason: Equatable {
+    /// 第1層: 録音実効長(キー押下〜離しの長さ、プリロール除く)が閾値未満だった。
+    case tooShort
+    /// 第2〜5層: 発話とみなせるエネルギーが無い、VAD/no_speech_probにより発話区間が
+    /// 検出されなかった、または既知のハルシネーション定型句のみと判定された。
+    case silence
+}
+
 /// どちらの操作方法で録音が開始されたか(PTTのkeyUpとトグルのkeyUpを混同しないため)
 private enum ActivationSource {
     case pushToTalk
@@ -51,6 +62,9 @@ final class Coordinator: AudioCaptureEngineDelegate {
     /// `.transcribing`中の内部フェーズが変わるたびに呼ばれる(HUDの「認識中/整形中」表示切替用)。
     /// 表示専用の通知であり、状態機械のロジックには影響しない。
     var onPhaseChanged: ((TranscriptionPhase) -> Void)?
+    /// ハルシネーション対策(多層防御)により文字起こし結果がスキップされた際に呼ばれる。
+    /// テキスト挿入もLLM整形も行わない(HUDの「短すぎるためキャンセル」「無音のためキャンセル」表示用)。
+    var onRecordingSkipped: ((RecordingSkipReason) -> Void)?
 
     private let audioEngine: AudioCaptureEngineControlling
     private let transcriptionEngine: TranscriptionEngine
@@ -63,10 +77,31 @@ final class Coordinator: AudioCaptureEngineDelegate {
     /// 結果が得られても挿入せず破棄する(whisper_full自体は中断しない)。
     private var discardPendingTranscriptionResult = false
 
-    init(audioEngine: AudioCaptureEngineControlling, transcriptionEngine: TranscriptionEngine, textFormatter: TextFormatter? = nil) {
+    /// ハルシネーション対策(多層防御)の第1層: 録音実効長(キー押下〜離しの長さ、プリロール除く)の
+    /// 最短閾値。これ未満なら文字起こし自体を行わない(設定不要のハードコード)。
+    /// 誤ってホットキーに触れてすぐ離した場合の無音ハルシネーションを、whisper_full呼び出し前の
+    /// 最も早い段階で弾くためのガード。
+    static let minimumEffectiveRecordingDuration: TimeInterval = 0.3
+
+    /// 現在時刻を取得するためのクロージャ。既定は実時計(`Date.init`)。
+    /// テストでは`beginPushToTalk()`〜`endPushToTalk()`が実時間ではなく同期的に(数マイクロ秒で)
+    /// 呼ばれるため、実時計のままだと第1層の最短録音時間ガードに常に引っかかってしまう。
+    /// そのため単調に増加する値を返すフェイクへ差し替えられるようにしている
+    /// (`minimumEffectiveRecordingDuration`自体は変更せず、時刻の取得元だけを注入する設計)。
+    private let now: () -> Date
+    /// 録音開始時刻(`now()`で取得)。録音実効長の算出に使う。
+    private var recordingStartedAt: Date?
+
+    init(
+        audioEngine: AudioCaptureEngineControlling,
+        transcriptionEngine: TranscriptionEngine,
+        textFormatter: TextFormatter? = nil,
+        now: @escaping () -> Date = Date.init
+    ) {
         self.audioEngine = audioEngine
         self.transcriptionEngine = transcriptionEngine
         self.textFormatter = textFormatter
+        self.now = now
         self.audioEngine.delegate = self
         updateCancelShortcutEnabled()
     }
@@ -95,6 +130,7 @@ final class Coordinator: AudioCaptureEngineDelegate {
         }
         activationSource = .pushToTalk
         recordingFrontmostApp = NSWorkspace.shared.frontmostApplication
+        recordingStartedAt = now()
         state = .recording
         audioEngine.startRecording()
     }
@@ -113,6 +149,7 @@ final class Coordinator: AudioCaptureEngineDelegate {
         case .idle:
             activationSource = .toggle
             recordingFrontmostApp = NSWorkspace.shared.frontmostApplication
+            recordingStartedAt = now()
             state = .recording
             audioEngine.startRecording()
         case .recording where activationSource == .toggle:
@@ -195,10 +232,45 @@ final class Coordinator: AudioCaptureEngineDelegate {
                 state = .transcribing
             }
             let frontmostAppAtRecordingStart = recordingFrontmostApp
+
+            // ハルシネーション対策(多層防御)の第1層: 録音実効長(キー押下〜離しの長さ、プリロール除く)
+            // が閾値未満なら、whisper_full自体を呼ばずここで打ち切る。
+            let effectiveDuration = recordingStartedAt.map { now().timeIntervalSince($0) } ?? .infinity
+            recordingStartedAt = nil
+            guard effectiveDuration >= Self.minimumEffectiveRecordingDuration else {
+                log.info("Recording effective duration (\(effectiveDuration, privacy: .public)s) below minimum (\(Self.minimumEffectiveRecordingDuration, privacy: .public)s); skipping transcription")
+                finishSkipped(reason: .tooShort)
+                return
+            }
+
+            // ハルシネーション対策(多層防御)の第2層: 先頭無音トリム後の実効サンプルに
+            // 発話とみなせるエネルギーが無ければ、同じくwhisper_full自体を呼ばず打ち切る。
+            let trimmedForEnergyCheck = AudioPreprocessing.trimLeadingSilence(samples: samples, sampleRate: sampleRate)
+            guard AudioPreprocessing.hasSufficientEnergy(samples: trimmedForEnergyCheck, sampleRate: sampleRate) else {
+                log.info("No sufficient speech energy detected in recording; skipping transcription")
+                finishSkipped(reason: .silence)
+                return
+            }
+
             onPhaseChanged?(.recognizing)
             do {
-                let rawText = try await transcriptionEngine.transcribe(samples: samples, sampleRate: sampleRate)
-                log.info("Transcription result: \(rawText, privacy: .private)")
+                let transcribedText = try await transcriptionEngine.transcribe(samples: samples, sampleRate: sampleRate)
+                log.info("Transcription result: \(transcribedText, privacy: .private)")
+
+                // ハルシネーション対策(多層防御)の第5層(最終防衛線): 出力全体が既知の
+                // ハルシネーション定型句のみで構成される場合は空文字扱いにする。
+                // (第3層のVAD・第4層のno_speech_probセグメントフィルタは`transcriptionEngine`
+                //  内部、すなわち`transcribedText`が既に反映された結果として届く)
+                var rawText = transcribedText
+                if !rawText.isEmpty, HallucinationFilter.isLikelyHallucination(rawText) {
+                    log.info("Discarding output that matches a known hallucination phrase")
+                    rawText = ""
+                }
+
+                guard !rawText.isEmpty else {
+                    finishSkipped(reason: .silence)
+                    return
+                }
 
                 // LLM整形(設定でON、かつフォーマッタが注入されている場合のみ)。状態は`.transcribing`の
                 // ままなので、メニューバーは整形中も「処理中」表示を継続する。整形中にEscでキャンセルが
@@ -224,6 +296,22 @@ final class Coordinator: AudioCaptureEngineDelegate {
             if state == .transcribing {
                 state = .idle
             }
+        }
+    }
+
+    /// ハルシネーション対策の各層で「文字起こし自体をスキップ/空文字として扱う」と判定した際の
+    /// 後始末(通常の完了経路と同じ状態リセットを行った上で、`onTranscriptionResult`の代わりに
+    /// `onRecordingSkipped`を呼ぶ)。テキスト挿入もLLM整形も行わない。
+    private func finishSkipped(reason: RecordingSkipReason) {
+        if discardPendingTranscriptionResult {
+            log.info("Recording was already flagged for cancel-discard; skip notification suppressed")
+        } else {
+            onRecordingSkipped?(reason)
+        }
+        discardPendingTranscriptionResult = false
+        recordingFrontmostApp = nil
+        if state == .transcribing {
+            state = .idle
         }
     }
 

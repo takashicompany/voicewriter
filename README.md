@@ -101,13 +101,13 @@ STTモデルは [ggml-large-v3-turbo](https://huggingface.co/ggerganov/whisper.c
 
 このスクリプトは、ダウンロード前にホームディレクトリの空き容量を確認し、`.part`拡張子で一時ファイルとしてダウンロードしてから、SHA-256を検証した上で成功時のみ最終ファイル名にリネームします(中断・改ざん・破損したファイルが残らないようにするため)。URLは`main`ブランチではなく特定コミット(revision)に固定し、期待するSHA-256をスクリプト内に記録しているため再現性があります。既に同一のSHA-256を持つファイルが配置済みの場合はダウンロードをスキップします。
 
-任意機能のVAD(Voice Activity Detection、既定OFF)を使う場合は、追加でSilero-VADモデル(約860KB)を配置します。
+VAD(Voice Activity Detection)は既定ONです(詳細・経緯は下記「無音・誤押下時のハルシネーション対策(多層防御)」参照)。必要なSilero-VADモデル(約860KB)はアプリ起動時に未配置であればバックグラウンドで自動ダウンロードされます(`VadModelAutoProvisioner`)。オフライン環境や自動ダウンロードに失敗した場合は、手動で以下を実行しても配置できます。
 
 ```sh
 ./scripts/download-vad-model.sh
 ```
 
-配置先は`~/Library/Application Support/Voicewriter/models/ggml-silero-v5.1.2.bin`です。取得元・検証方法は`download-model.sh`と同様(SHA-256固定・`.part`経由の原子的な配置)です。モデルを配置した上で設定画面の「音声認識」タブでVADを有効化してください。
+配置先は`~/Library/Application Support/Voicewriter/models/ggml-silero-v5.1.2.bin`です。取得元・検証方法は`download-model.sh`と同様(SHA-256固定・`.part`経由の原子的な配置)で、アプリ起動時の自動ダウンロードも同一のURL・SHA-256を使います。
 
 ### 起動時のロードとフォールバック
 
@@ -125,11 +125,11 @@ STTモデルは [ggml-large-v3-turbo](https://huggingface.co/ggerganov/whisper.c
   - 一次情報: https://github.com/ggml-org/whisper.cpp/blob/v1.9.1/examples/cli/cli.cpp#L31-L82 (`params.beam_size`/`params.best_of`の初期化・`wparams.strategy`の決定ロジック)
 - **`greedy.best_of=5`も明示的に設定**: `beam_search.beam_size`だけでなく`greedy.best_of`も5に設定しています。temperatureフォールバックで温度が0を超えると、ビームサーチではなくgreedy側の`best_of`本の候補を生成して最良のものを選ぶ経路を通るため、`greedy.best_of`を設定し忘れると既定値の0のままになりフォールバック時の候補数が意図せず変わってしまいます。whisper-cliは`wparams.greedy.best_of = params.best_of`を常に設定しており(`params.best_of`の既定値も5)、これに合わせました。
 - **temperatureフォールバックの閾値をwhisper-cli既定値に明示的に固定**: `temperature=0.0`, `temperature_inc=0.2`, `entropy_thold=2.4`, `logprob_thold=-1.0`, `suppress_blank=true`。値自体は`whisper_full_default_params`の既定値と同一ですが、whisper.cppのバージョン間で既定値が変わっても挙動が変化しないよう明示的に設定しています(出典は上記`src/whisper.cpp`と同じ)。
-- **`suppress_nst=true`(非音声トークン抑制)・`no_speech_thold=0.2`に変更**: whisper-cliの既定値(`suppress_nst=false`, `no_speech_thold=0.6`)ではなく、本アプリと同様に「プッシュ・トゥ・トークで短い発話単位を都度デコードする」実装であるHandy(内部でcjpais/transcribe-rsのwhisper.cppラッパーを利用)の実運用値を採用しました。どちらも無音・ノイズ区間での無関係なトークン出力(ハルシネーション)を抑える方向に働きます。
+- **`suppress_nst=true`(非音声トークン抑制)・`no_speech_thold=0.2`に変更(※後日`0.6`に差し戻し)**: 当初はwhisper-cliの既定値(`suppress_nst=false`, `no_speech_thold=0.6`)ではなく、本アプリと同様に「プッシュ・トゥ・トークで短い発話単位を都度デコードする」実装であるHandy(内部でcjpais/transcribe-rsのwhisper.cppラッパーを利用)の実運用値を採用していました。**その後、「無音・誤押下時のハルシネーション対策(多層防御)」の作業で`no_speech_thold`を`0.6`(whisper-cli既定値)に差し戻しています。理由は下記「無音・誤押下時のハルシネーション対策(多層防御)」の`no_speech_thold`の項を参照してください**(`suppress_nst=true`自体は維持)。
   - 一次情報: https://github.com/cjpais/transcribe-rs/blob/main/src/whisper_cpp/mod.rs (`WhisperInferenceParams::default()`: `suppress_non_speech_tokens=true`, `no_speech_thold=0.2`)
 - **語彙ヒント(`initial_prompt`)を追加**: 設定画面の「音声認識」タブ、または`defaults write dev.voicewriter.app sttVocabularyHint -string "..."`で、固有名詞・専門用語のヒントをカンマ区切りで登録できます(既定値は`"Voicewriter"`)。whisper.cppの`initial_prompt`はデコーダの文脈として働き、強制はしませんが固有名詞の誤認識を減らす手がかりになります。Amicalの語彙ヒント機能を参考にしました。設定は`WhisperCppEngine`が呼び出しごとに読むため、エンジン再ロード無しで次回の文字起こしから反映されます。
 - **先頭の低エネルギー区間(無音/発話前ノイズ)のトリム**: `AudioPreprocessing.trimLeadingSilence`(`Sources/Voicewriter/Transcription/AudioPreprocessing.swift`)が、20msフレーム単位のRMSがしきい値(既定0.015)を初めて超える位置の0.15秒手前までをトリムしてから`whisper_full`に渡します(最大トリム量1秒、全区間が無音の場合はトリムしません)。AlwaysOnモードのプリロール(既定0.5秒)に発話前のノイズが混入し、それがハルシネーションを誘発するケースへの対策です。純粋関数として切り出しており、`Tests/VoicewriterTests/AudioPreprocessingTests.swift`で単体テスト済みです。
-- **VAD(Voice Activity Detection)をオプション機能として追加(既定OFF)**: whisper.cpp v1.9.1では`whisper_full_params`自体にVAD(Silero-VADベース)が統合されています。設定画面の「音声認識」タブでVADを有効にすると、`scripts/download-vad-model.sh`で配置した`ggml-silero-v5.1.2.bin`を使って発話区間だけをデコードします。無音・非音声区間でのハルシネーション(下記issue参照)の軽減が期待される機能です。VADパラメータ自体はwhisper.cppの既定値(`whisper_vad_default_params()`: `threshold=0.5, min_speech_duration_ms=250, min_silence_duration_ms=100, speech_pad_ms=30, samples_overlap=0.1`)をそのまま使っています。
+- **VAD(Voice Activity Detection)をオプション機能として追加(当初は既定OFF、※後日既定ONに変更)**: whisper.cpp v1.9.1では`whisper_full_params`自体にVAD(Silero-VADベース)が統合されています。設定画面の「音声認識」タブでVADを有効にすると、`ggml-silero-v5.1.2.bin`を使って発話区間だけをデコードします。無音・非音声区間でのハルシネーション(下記issue参照)の軽減が期待される機能です。VADパラメータは`whisper_vad_default_params()`の既定値(`threshold=0.5, min_speech_duration_ms=250, min_silence_duration_ms=100, samples_overlap=0.1`)をベースに、`speech_pad_ms`のみ`30`→`100`に変更しています(理由は下記「無音・誤押下時のハルシネーション対策(多層防御)」参照)。**VADの既定ON化・モデル自動ダウンロードについても同セクション参照**。
   - 一次情報: https://github.com/ggml-org/whisper.cpp/blob/v1.9.1/README.md#voice-activity-detection-vad
   - 末尾無音でのハルシネーション報告(公式issue): https://github.com/ggml-org/whisper.cpp/issues/1724
 - **AVAudioConverterのサンプルレート変換品質を明示的に`.max`に設定**: `AudioCaptureEngine.installTapIfNeededLocked`で生成する`AVAudioConverter`は、`sampleRateConverterQuality`が未指定だとシステム既定(品質はドキュメント上未規定)になります。マイクのネイティブサンプルレート(多くは44.1/48kHz)から16kHzへ毎回ダウンサンプルするため、明示的に最高品質を指定しました。
@@ -165,6 +165,7 @@ swift run verify-whisper scripts/fixtures/sample-ja-16k.wav
 | `sample-ja-silence-pad-16k.wav` | 前後に1秒の無音を付加した版(先頭無音トリムの確認用) |
 | `sample-ja-preroll-noise-16k.wav` | 先頭に0.5秒の低振幅ホワイトノイズを付加した版(プリロールノイズによるハルシネーション誘発の確認用) |
 | `sample-ja-10s-16k.wav` | 約11秒の速度計測用フィクスチャ |
+| `sample-silence-16k.wav` | `ffmpeg`の`anullsrc`で生成した3秒間の完全な無音(振幅ゼロ)。無音ハルシネーション対策の検証用(下記「無音・誤押下時のハルシネーション対策(多層防御)」参照) |
 
 `verify-whisper`はA/B比較用に以下の環境変数をサポートしています(省略時は本アプリの既定と同一)。
 
@@ -173,6 +174,7 @@ VERIFY_WHISPER_STRATEGY=greedy swift run verify-whisper scripts/fixtures/sample-
 VERIFY_WHISPER_VAD=1 swift run verify-whisper scripts/fixtures/sample-ja-silence-pad-16k.wav  # VADを有効化(要ggml-silero-v5.1.2.bin)
 VERIFY_WHISPER_NO_TIMESTAMPS=1 swift run verify-whisper scripts/fixtures/sample-ja-16k.wav    # no_timestamps=true
 VERIFY_WHISPER_VOCAB_HINT="" swift run verify-whisper scripts/fixtures/sample-ja-16k.wav      # 語彙ヒントなしで検証
+VERIFY_WHISPER_NO_SPEECH_FILTER=0 swift run verify-whisper scripts/fixtures/sample-silence-16k.wav  # セグメント単位no_speech_probフィルタ(第4層)を無効化して比較
 ```
 
 ## マイク権限について
@@ -342,7 +344,7 @@ python3 scripts/benchmark-formatter.py
 | `sttLanguage` | string | `ja` | whisper.cppの言語設定。`auto`で自動判定 |
 | `sttVocabularyHint` | string | `Voicewriter` | whisper.cppの`initial_prompt`に渡す語彙ヒント(固有名詞・専門用語、カンマ区切り推奨)。空文字を明示的に設定するとヒント無し |
 | `debugSaveLastRecording` | bool | `false` | **[隠し設定・UIなし]** 直近1回分の文字起こし対象音声(先頭無音トリム後、`whisper_full`に渡す直前の16kHz/mono/Float32サンプル)を`~/Library/Application Support/Voicewriter/Debug/last-recording.wav`へ上書き保存するデバッグ機能。公式`whisper-cli`への同一入力比較や、マイク入力パイプラインの音質(ゲイン・クリッピング・ノイズ)の事後検証に使う |
-| `vadEnabled` | bool | `false` | VAD(Voice Activity Detection)を有効にするか。有効化には`scripts/download-vad-model.sh`でのモデル配置が必要(未配置の場合は警告ログを出して無効のまま動作する) |
+| `vadEnabled` | bool | `true` | VAD(Voice Activity Detection)を有効にするか。既定ON(無音・誤押下時のハルシネーション対策、詳細は該当セクション参照)。モデルはアプリ起動時にバックグラウンドで自動ダウンロードされる(未配置/ダウンロード失敗中は警告ログを出して無効のまま動作する) |
 | `formattingEnabled` | bool | `true` | 音声認識結果に対するLLM整形(Ollama)を行うかどうか。OFFでもwhisper.cppの生出力はそのまま挿入される |
 | `formattingModel` | string | `qwen3:14b` | LLM整形に使うOllamaモデル名。設定画面「整形」タブで`/api/tags`から動的取得した一覧から選択可能(選定根拠は「LLM整形パス」参照) |
 | `formattingTimeoutSeconds` | double | `10.0` | LLM整形リクエストのタイムアウト秒数。超過時はwhisper.cppの生出力へフォールバックする |
@@ -464,6 +466,9 @@ scripts/
   - `log show --predicate 'subsystem == "dev.voicewriter.app"'`で、起動時に`OllamaFormatter`カテゴリの`Preloaded formatting model into Ollama: qwen3:14b`が出ること(起動時プリロードが機能していること)
   - `defaults write dev.voicewriter.app sttEngine -string stub`にして`.app`を再起動し、System Events経由でトグルショートカット(⌥⇧Space)を実際に送って録音開始→停止を発火させ、スタブ文字起こし結果に対して実際にOllamaへ整形リクエストが送られたこと(整形失敗の警告ログが出ないこと)、メニューバーの「最後の文字起こし結果をコピー」→クリップボードの内容が、同じ入力を`scripts/benchmark-formatter.py`の呼び出しロジックで直接Ollamaへ送った場合の出力(`{"text": "[スタブ文字起こし: 2.7秒の音声を録音しました]"}`、この入力は整形不要と判断され原文のまま返る)と一致することを確認済み(パイプライン全体がOllamaへの実リクエストを介して結線されていることの実機確認)。検証後は`sttEngine`設定を削除して既定(whisperCpp)に戻した。
   - `OllamaFormatterIntegrationTests`(実際にローカルOllamaへHTTPリクエストを送るテスト)が3件とも成功すること(Ollama未起動環境では`XCTSkip`で自動的にスキップされる)
+- **無音・誤押下時のハルシネーション対策(多層防御、詳細は該当セクション参照)追加後**、`swift build` / `swift build -c release` / `scripts/build-app.sh release` / `swift test`(90件、`AudioPreprocessingTests`に6件・`HallucinationFilterTests`9件・`WhisperCppEngineSegmentFilterTests`7件・`CoordinatorRecordingSkipTests`5件を新規追加)がすべて成功することを確認済み。`swift run -c release verify-whisper`で以下を確認:
+  - 新規作成した完全な無音WAV(`scripts/fixtures/sample-silence-16k.wav`)で、VAD無効(デコードパラメータのみ)だと実際に「ご視聴ありがとうございました」というハルシネーションが再現すること、VAD有効(`VERIFY_WHISPER_VAD=1`)にすると`Final speech segments after filtering: 0`となり出力が完全に空になることを確認済み(公式README記載のVAD挙動の実地確認)。
+  - 既存の日本語フィクスチャ(`sample-ja-16k.wav`ほか計7件)を`no_speech_thold`差し戻し(0.2→0.6)・`speech_pad_ms`変更(30→100ms)後に再実行し、いずれも変更前と完全に同一の認識結果(回帰なし)であることを確認済み。
 
 ## 並行処理まわりの修正(Codexレビュー対応)
 
@@ -612,6 +617,114 @@ Codexの静的レビューで、`AudioCaptureEngine`まわりの並行処理に�
 - 実マイク環境の音質検証は、隠し設定(`debugSaveLastRecording`)を追加したのみで、実機での録音・比較は未実施(下記「未確認・今後の課題」参照)。
 - `initial_prompt`のデフォルト文言("Voicewriter"のみ)は最小限に留めており、句読点誘導や追加の固有名詞リストは含めていない(設定画面から自由に追加可能)。
 
+## 無音・誤押下時のハルシネーション対策(多層防御)
+
+### 症状と原因
+
+何も話さずにホットキーを押した場合や、誤って押してすぐ離した場合に、「ご視聴ありがとうございました」「ご清聴ありがとうございました」等の定型句が挿入される不具合が報告されました。これはwhisperの既知の無音ハルシネーションで、学習データに含まれるYouTube動画の字幕(動画終端の定型的な挨拶)に由来するとされています。
+
+- 一次情報(公式issue、末尾無音でのハルシネーション報告): https://github.com/ggml-org/whisper.cpp/issues/1724
+- 日本語での同種の報告: https://github.com/amicalhq/amical/issues/71 (「ありがとうございました」「おやすみなさい」「ご視聴ありがとうございました」が実際に報告されている)
+
+実際に`ffmpeg`の`anullsrc`で生成した完全な無音WAV(`scripts/fixtures/sample-silence-16k.wav`、3秒)を`verify-whisper`に通したところ、この問題を確実に再現できました。
+
+```
+$ swift run -c release verify-whisper scripts/fixtures/sample-silence-16k.wav
+==> Result (1 segments):
+ご視聴ありがとうございました
+```
+
+この再現結果を軸に、whisper_full呼び出し前〜出力後までの各段階で早期に弾く多層防御を実装しました(上から順に早い段階で弾く)。
+
+### 第1層: 最短録音時間ガード(`Coordinator`)
+
+録音実効長(プリロールを除く、キー押下〜文字起こし開始までの壁時計ベースの経過時間)が閾値(既定`0.3`秒、`Coordinator.minimumEffectiveRecordingDuration`、設定不要のハードコード)未満の場合、`whisper_full`(`transcriptionEngine.transcribe`)自体を呼ばずに打ち切ります。誤ってホットキーに触れてすぐ離した場合を、最も早い段階(録音サンプルの中身を見る前)で弾くためのガードです。
+
+サンプル数(`samples.count / sampleRate`)ではなく、実際のキー押下〜完了までの経過時間(`Date`ベース)で判定している点が重要です。プリロール分のサンプルが録音バッファに含まれるAlwaysOnモードでは、サンプル数から算出する長さはプリロール秒数(既定0.5秒)分だけ実際の押下時間より長く見えてしまい、閾値判定がプリロール秒数に依存してしまうためです。
+
+### 第2層: エネルギーゲート(`AudioPreprocessing.hasSufficientEnergy`)
+
+`AudioPreprocessing.trimLeadingSilence`適用後の実効サンプルに対し、「確実な無音」と判定できる場合に限ってスキップ対象とする保守的な設計にしています。判定は次の2条件の**AND**(両方成立して初めて無音とみなす):
+
+- 全体のRMS(平均音量)が`globalRmsThreshold`(既定`0.003`、約-50dBFS相当)未満
+- 20ms単位のフレームで最大のRMSも`maxFrameRmsThreshold`(既定`0.006`、約-44dBFS相当)未満
+
+単純な瞬間ピーク振幅(1サンプルの最大値)は判定に使っていません。マイクのクリック/ポップノイズは瞬間ピークだけを不自然に押し上げることがあり、ピーク単独だと「クリック音だけの録音」を発話ありと誤判定してしまうためです。20msフレーム単位のRMSであれば、単発クリックのエネルギーは短時間平均に均されてもなお検出可能でありながら、瞬間値ほど過敏ではありません。また2条件をANDにしているのは、全体RMSだけだと長い録音の一部にだけ短い発話があるケースを平均に埋もれさせて誤って無音判定してしまう恐れがあり、フレーム最大RMSだけだと逆に環境ノイズの瞬間的な揺らぎを拾いすぎる恐れがあるためです。
+
+閾値は`trimLeadingSilence`のフレーム単位閾値(既定`0.015`、発話開始位置の検出用)よりもかなり低く(緩く)設定しています。目的が異なり、ここでは「本当に発話が無い」ことに高い確信が持てる場合だけを棄却したい(小声の正当な発話を誤って無音扱いしてしまうfalse negativeを避けたい)ためです。
+
+該当すればここでも`whisper_full`を呼ばずに打ち切ります。
+
+### 第3層: VAD(既定ON化・自動ダウンロード)
+
+whisper.cpp v1.9.1では`whisper_full_params`自体にVAD(Silero-VADベース)が統合されており、発話区間が全く検出されなければ**空文字を返します**(公式README「Voice Activity Detection (VAD)」セクションで説明されている挙動です。 https://github.com/ggml-org/whisper.cpp/blob/v1.9.1/README.md#voice-activity-detection-vad )。実際に上記の無音WAVで検証したところ、この挙動を確認できました。
+
+```
+$ VERIFY_WHISPER_VAD=1 swift run -c release verify-whisper scripts/fixtures/sample-silence-16k.wav
+...
+whisper_vad_segments_from_probs: Final speech segments after filtering: 0
+==> Result (0 segments):
+
+```
+
+VADは以前は任意機能として既定OFFでしたが、**今回既定ONに変更しました**(`Settings.vadEnabled`)。VADモデル(Silero-VAD、約885KB)が未配置の場合は警告ログを出してVAD無しで動作し(安全側のフォールバック、既存の`WhisperCppEngine`のロジックのまま)、この層は事実上スキップされます。
+
+VADモデルの配置については、当初は既存の`scripts/download-vad-model.sh`による手動配置のみとし、自動ダウンロードは見送る方針で設計していました(モデルを配置していないユーザーには影響が及ばない範囲で機能追加したいと考えたため)。しかし上記の無音WAV検証で、VADが「発話区間ゼロ→空文字」という形で他のどの層よりも直接的・確実にこの症状を防いでいることが実測で分かった一方、後述の通りデコードパラメータ側の対策(`no_speech_thold`)は今回の再現ケースには効果が無いことも判明しました。VADが多層防御の中でも中心的な役割を担うと分かった以上、モデル未配置のままではこの防御が機能しないユーザーが大半になってしまい、対策として片手落ちになります。VADモデルは約885KBとメインSTTモデル(約1.6GB)の1/1800程度のサイズで、ユーザー体験への影響も軽微と判断し、**アプリ起動時にVADモデルが未配置であればバックグラウンドで自動ダウンロードする**方針に転換しました(`VadModelAutoProvisioner.swift`)。ダウンロード元・SHA-256検証は`scripts/download-vad-model.sh`と完全に同一です。ベストエフォート(失敗してもアプリの起動・他機能には一切影響しない、次回起動時に再試行)、UIをブロックしない(`Task.detached`でバックグラウンド実行)設計です。
+
+あわせて、VADのパラメータのうち`speech_pad_ms`(検出した発話区間の前後に足す余白)を既定の`30`msから`100`msへ引き上げました。VADを既定ONにしたことで露出(実際にこのパラメータが効く場面)が増えるため、語頭の子音・語尾の音が短く削られて認識精度が落ちるリスクを避ける安全マージンです。他のVADパラメータ(`threshold=0.5`, `min_speech_duration_ms=250`, `min_silence_duration_ms=100`)はwhisper.cpp既定値のままです。
+
+### 第4層: セグメント単位no_speech_probフィルタ(`WhisperCppEngine.filterSegments`)
+
+whisper.cpp v1.9.1の`whisper.h`には、セグメント単位のno_speech確率を取得するAPI(`whisper_full_get_segment_no_speech_prob`)が存在することを確認しました。`WhisperCppEngine.runFull`はデコード後、各セグメントについてこの値を取得し、閾値(既定`0.6`)以上のセグメントを出力から除外します。この閾値は、VoiceInk(https://github.com/Beingpax/VoiceInk )の実装調査(値のみ参考、コード引用なし)で「`no_speech_prob`が60%を超えるセグメントを棄却する」フィルタを実装していることを確認した上で、同じ値を採用しました。
+
+判定ロジックは`WhisperCppEngine.filterSegments(_:threshold:)`という純粋関数として切り出しており(セグメントのテキストとno_speech_probのタプル列を受け取り、閾値以上を除外して残りを連結する)、実際のwhisper.cppコンテキストなしで単体テストできます(`Tests/VoicewriterTests/WhisperCppEngineSegmentFilterTests.swift`)。`VerifyWhisper`にも同一ロジックを複製しており(`VERIFY_WHISPER_NO_SPEECH_FILTER=0`で無効化して比較可能)、通常のフィクスチャでは除外されるセグメントが無いことを確認済みです。
+
+### 第5層: 既知ハルシネーション語句フィルタ(最終防衛線、`HallucinationFilter`)
+
+出力全体が既知の無音ハルシネーション定型句(句読点等の差異を正規化した上でのほぼ一致)のみで構成される場合に、その出力を空文字扱いにします。**発話の一部として本当にこれらの語句を言った場合を誤って棄却しないよう、「出力の全体がこの語句だけ」の場合に限定**しています(部分一致では判定しません)。
+
+語句リストは「ご視聴/ご清聴/ご静聴ありがとうございました」系・「チャンネル登録よろしくお願いします」系など、**動画(YouTube等)固有性が高く、通常の会話・チャットの返信としては使われにくい句のみ**に限定しています。正規化は句読点・空白・改行等の除去に加え、`precomposedStringWithCompatibilityMapping`(NFKC相当)による全角/半角等の表記揺れの吸収も行っています。
+
+**(改訂)** 当初はamicalhq/amical#71で報告された「ありがとうございました」「おやすみなさい」のような汎用的な挨拶句も語句リストに含めていましたが、レビューにより「ユーザーがチャットへの短い返信として"ありがとうございます"とだけ音声入力するのは普通の使い方であり、その場合VADも発話を検出しwhisperも正しく認識しているにもかかわらず、この最終フィルタが全文一致で消してしまう」という指摘を受け、除外しました。「出力全体が完全一致する場合に限定する」という設計だけでは、この種の短い定型的な発話全体を毎回誤って棄却してしまうリスクを避けられないと判断したためです。「ご視聴ありがとうございました」等の動画固有性の高い句は、通常の会話・チャットの返信としてまず使われないため、これまで通り含めています。
+
+判定は`HallucinationFilter.isLikelyHallucination(_:)`という純粋関数で、`Tests/VoicewriterTests/HallucinationFilterTests.swift`で単体テスト済みです(完全一致・句読点付き・混在ケース(定型句が実発話の一部に含まれるだけの場合は棄却しないこと)・汎用的な挨拶句が単独でも棄却されないことを含む)。
+
+### 全体のフロー(`Coordinator`)
+
+```
+録音終了
+  → 第1層: 実効録音時間 < 0.3秒?  → Yes: スキップ(whisper_full呼ばず)
+  → 第2層: エネルギーゲート(無音)? → Yes: スキップ(whisper_full呼ばず)
+  → transcriptionEngine.transcribe() ※内部でVAD(第3層)・no_speech_probフィルタ(第4層)が効く
+  → 結果が既知フレーズのみ(第5層)? → Yes: 空文字扱い
+  → 結果が空文字?                  → Yes: LLM整形もテキスト挿入も行わずスキップ
+  → LLM整形 → テキスト挿入
+```
+
+第1〜2層でスキップした場合、および第3〜5層の結果が最終的に空文字になった場合のいずれも、テキスト挿入・LLM整形は一切行わず、`Coordinator.onRecordingSkipped`(`RecordingSkipReason.tooShort` / `.silence`)を通じてHUDに「短すぎるためキャンセル」「無音のためキャンセル」を1秒間表示します(`StatusHUDController.reportRecordingSkipped`)。
+
+### テスト
+
+- `AudioPreprocessingTests`: `hasSufficientEnergy`の単体テスト(空・純無音・大声・低レベルノイズ・全体RMSでは埋もれるが短時間なら閾値を超える発話・クリックノイズ単体・長い無音に埋もれた短い発話、のケースを含む)
+- `HallucinationFilterTests`: 空文字・完全一致・句読点付き一致・混在ケース(定型句が実発話の一部)・部分文字列一致だけでは判定しないこと、を含む
+- `WhisperCppEngineSegmentFilterTests`: `filterSegments`の閾値境界(ちょうど閾値、閾値未満)・複数セグメントの一部のみ除外、を含む
+- `CoordinatorRecordingSkipTests`: 第1〜2層で`transcribe`自体が呼ばれないこと、第5層(既知フレーズのみの出力)で`onRecordingSkipped`が呼ばれテキスト挿入されないこと、フレーズが実発話に混在する場合は正常に挿入されること、を`Coordinator`レベルの統合テストとして確認
+- 既存の`CoordinatorCancelDuringTranscribingTests`/`CoordinatorFormattingTests`は、テスト内で`beginPushToTalk()`〜`endPushToTalk()`が実時間ではなく同期的に呼ばれるため、第1層の最短録音時間ガードに常にひっかかってしまう問題があった。`Coordinator`のイニシャライザに現在時刻取得用のクロージャ(`now: () -> Date`、既定は実時計)を注入できるようにし、テストでは単調に増加するフェイク時計へ差し替えることで対応した(`minimumEffectiveRecordingDuration`自体は変更していない)。あわせてダミー音声サンプルも無音(`[0.0, 0.0]`)から発話とみなせる振幅のものに変更した。
+
+`swift test`は全90件(新規追加分含む)成功。無音WAV(`sample-silence-16k.wav`)・既存の日本語フィクスチャいずれも`verify-whisper`で回帰確認済み(下記「動作確認済み事項」参照)。
+
+### Codexによる指摘と対応
+
+一次実装後、Codex(独立した読み取り専用の検証)にコードの事実(no_speech_thold等whisper.cppパラメータの実装内容、フィルタ設計)のみを渡してレビューを依頼しました。指摘7件への対応は以下の通りです(採用/不採用いずれも理由を明記)。
+
+1. **最短録音ガードはサンプル数ではなく壁時計時間で判定すべき**: 実装時点から壁時計(`Date`)ベースで判定しており、対応不要(サンプル数ベースにしていた場合、プリロール秒数に応じて実効的な閾値が変動してしまう問題を指摘されたもの)。
+2. **`no_speech_thold=0.2`は複合条件のため単独では効かない**: whisper.cpp本体のソース(`src/whisper.cpp`、v1.9.1)を実際に確認したところ、`is_no_speech = (state->no_speech_prob > params.no_speech_thold && best_decoder.sequence.avg_logprobs < params.logprob_thold)`という**AND条件**でのみそのデコード結果の出力自体が抑制される実装だった。自信を持って(=avg_logprobsが高いまま)生成されるハルシネーション定型句はavg_logprobs側の条件を満たさないため、`no_speech_thold`をいくら下げても抑制効果が無い。実際に無音WAVで`no_speech_thold=0.2`のままハルシネーションが再現することも確認済み。**採用**: whisper-cli既定値の`0.6`に戻した(下げるメリットが無い一方、正当な小声発話を誤って抑制するリスクだけが残るため)。
+3. **VAD既定ON化・`speech_pad_ms`の余白拡大・モデル自動配置**: **採用**(上記「第3層」参照)。特にVADモデルの自動ダウンロードは、当初「見送り」としていた判断を実測結果(VADが最も直接的にハルシネーションを防ぐことの確認)を踏まえて覆したもの。
+4. **エネルギーゲートをOR(RMSまたはピーク)ではなくAND(全体RMSかつフレーム最大RMS)の「確実な無音」判定にすべき**: **採用**(上記「第2層」参照)。ピーク単独判定はクリックノイズに弱いという指摘を反映した。
+5. **セグメント単位no_speech_probフィルタは、他の信号(VADの発話区間長・RMS等)と組み合わせた複合条件にすべき**: **不採用**。Web調査でVoiceInkの実装を確認したところ、同様に`no_speech_prob`単独の閾値判定(60%超で棄却)を採用しており、この設計が実際の先行事例と一致していることを確認済み。複合条件化は追加の複雑性・テスト負荷を伴う一方、本層はあくまで5層のうちの1層(VADが主防御、第5層が最終防衛線)であり、単独判定でも実用上十分と判断した。
+6. **既知フレーズリストから「ありがとうございます」「おやすみなさい」等の単独でも成立しうる文言を除外すべき(false positive対策)**: **採用(改訂)**。当初は元のタスク指示で明示的に列挙された例だったことを理由に不採用としていたが、その後の指摘で「ユーザーがチャットへの短い返信として"ありがとうございます"とだけ音声入力するのは普通の使い方であり、その場合VADも発話を検出しwhisperも正しく認識しているにもかかわらず、この最終フィルタが全文一致で消してしまう」という具体的な実害が指摘され、これは正当な指摘と判断した。「出力全体が完全一致する場合に限定する」という設計だけでは、汎用的な挨拶句という「単独でも高頻度に使われる短い定型的な発話」を毎回誤棄却してしまうリスクを避けられないため、`HallucinationFilter.knownPhrases`から「ありがとうございました」「ありがとうございます」「おやすみなさい」「またね」「バイバイ」を削除し、動画(YouTube等)固有性が高く通常の会話・チャットの返信としては使われにくい句(「ご視聴/ご清聴/ご静聴ありがとうございました」系・「チャンネル登録よろしくお願いします」系)のみに絞った。`HallucinationFilterTests`に「ありがとうございます」等が単独で棄却されないことを確認するテストを追加済み。
+7. **空文字を「スキップ」の目印にする代わりに専用のenum(例: `TranscriptionOutcome`)を導入すべき**: **不採用**。`RecordingSkipReason`(`.tooShort`/`.silence`)と`Coordinator.finishSkipped(reason:)`による早期return方式で、「スキップ時はLLM整形・テキスト挿入を一切行わない」という保証は既に構造的に満たされており(ガード節で早期returnし、`onTranscriptionResult`ではなく`onRecordingSkipped`を呼ぶ)、機能的には提案の意図を満たしていると判断した。パイプライン全体に新しい型を持ち込む広範囲なリファクタは、既存のテスト済みフローに対するリスクに見合わないと判断し見送った。
+
 ## 未確認・今後の課題
 
 - 実際のキー押下によるPTT/トグル/Escキャンセルの一連の動作は、キーボードイベントを直接シミュレートするテストは実施していません(UserDefaultsのショートカット登録値までは確認済み)。実機でキーを押して録音開始→停止→文字起こし→カーソル位置への挿入までを確認してください。
@@ -630,7 +743,7 @@ Codexの静的レビューで、`AudioCaptureEngine`まわりの並行処理に�
   - 「一般」タブのトグルでシステム設定 > 一般 > ログイン項目にVoicewriterが追加/削除されること(初回は承認待ちになる場合があります)
 - 既知の非関連事象: whisper.cppのMetalバックエンド(`ggml_metal_rsets_free`)が、アプリ終了(`NSApplication terminate:`)時の静的破棄処理中に稀に`abort()`することがある(本実装の変更以前から存在するwhisper.cpp側の既知の挙動で、今回の設定画面追加とは無関係)。今回の検証では`kill -TERM`によるクリーンな終了では再現しませんでした。
 - **実マイク環境での認識精度改善の効果は未確認**です。今回の調査・改善(ビームサーチ化・語彙ヒント・先頭無音トリム・VAD・AVAudioConverter品質設定)は`say`生成の合成音声フィクスチャでの回帰確認に留まり、報告された実際の誤認識(「ボイスライダー」「魅力」等の誤変換、類似フレーズの繰り返し)がこれらの変更で改善するかどうかは実機でのディクテーションで確認する必要があります。`defaults write dev.voicewriter.app debugSaveLastRecording -bool YES`で直近録音のWAVを保存できるので、誤認識が再発した場合はこのWAVを`swift run verify-whisper`に通して音質・パラメータ両面から追加調査してください。
-- **VADの実マイク環境での効果も未確認**です。公式issue #1724(末尾無音でのハルシネーション)は今回作成した合成フィクスチャでは再現できず、VAD有無の差も句読点スタイル程度でした。実際にハルシネーションが再発するようであれば、`defaults write dev.voicewriter.app vadEnabled -bool YES`(要`scripts/download-vad-model.sh`)で有効化して効果を確認してください。
+- **VADの実マイク環境での効果は、無音のみのWAVでは確認済み(上記「無音・誤押下時のハルシネーション対策」参照)ですが、実際のマイク入力(環境ノイズを含む無音、Bluetoothマイクのノイズフロア等)での効果は未確認**です。既定ONにしたため通常は有効ですが、`defaults write dev.voicewriter.app vadEnabled -bool NO`で無効化して比較できます。
 - **LLM整形の実マイク環境での効果は未確認**です。ベンチマーク(`scripts/benchmark-formatter.py`)はテキストを直接Ollamaへ送るテストケースでの比較であり、実際のディクテーション(whisper.cppの生出力)に対する効果は実機で確認する必要があります。実際に報告された誤認識例(「音声入力収入力後の後文字の精製」等)については、本実装(構造化出力+qwen3:14b)がテキストとして与えた場合に部分的な修正ができることを確認済みですが、完全な修正には至っていません(README「LLM整形パス」参照)。実機で誤認識が再発する場合は、設定画面「整形」タブでモデルを切り替えるか、タイムアウトを調整して比較してください。
 - 設定画面「整形」タブの実機でのモデル一覧取得・選択・タイムアウト変更のUI操作(マウスクリック・ピッカー選択)は、上記「設定ウィンドウの実機操作」と同様の理由でUI自動操作による確認ができていません。アプリのログ(`OllamaFormatter`/`Coordinator`カテゴリ)経由でのプリロード成功・整形リクエスト成功は確認済みです(下記「動作確認済み事項」参照)。
 - 上記「並行処理まわりの修正」で追加した以下の挙動は、実機での対話的な確認(実際のキー押下・Bluetoothデバイスの抜き差し・複数アプリ間でのフォーカス切り替えなど)を行っていません。
@@ -648,3 +761,7 @@ Codexの静的レビューで、`AudioCaptureEngine`まわりの並行処理に�
   - **起動時のEsc一時有効化対策(指摘#5)**: アプリ起動直後、録音を一切開始していない状態でEscキーが他アプリの操作(ダイアログのキャンセル等)を奪わないこと。
   - **5分上限と手動停止の競合(指摘#2)**: 5分の録音上限に達するタイミングとほぼ同時に手動でPTT/トグルを離した場合でも、文字起こし結果が正しく1回だけ得られ、空文字が挿入されたり結果が消えたりしないこと。
   - **構成変更復旧の失敗(指摘#4)**: 録音中にBluetoothヘッドセット等を抜き差しし、かつその直後にエンジン再起動そのものが失敗するような状況(通常のデバイス切替では起きにくい)で、メニューバー警告が出た上で次回の録音開始が正常に行えること。
+- **無音・誤押下時のハルシネーション対策(多層防御)**で追加した以下の挙動は、実機での対話的な確認(実際のホットキー押下)を行っていません(単体テスト・`verify-whisper`経由の合成音声/無音WAVでの確認に留まる)。
+  - 実際にホットキーを一瞬だけ押してすぐ離した場合(第1層)、実際に無音の部屋でホットキーを押した場合(第2層)に、それぞれ`whisper_full`が呼ばれず、HUDに「短すぎるためキャンセル」「無音のためキャンセル」が表示されること。
+  - VADモデルの初回自動ダウンロード(`VadModelAutoProvisioner`)が、実際にネットワーク接続がある初回起動時にバックグラウンドで成功し、ログ(`VAD model auto-downloaded and installed at ...`)が出ること。オフライン環境や既存モデル配置済み環境での挙動(ダウンロードをスキップ/失敗を無視して起動を継続すること)も未確認です。
+  - 実マイクでの息継ぎ・小声の相槌など、エネルギーゲート(第2層)の閾値(`globalRmsThreshold=0.003`, `maxFrameRmsThreshold=0.006`)が実際のマイク環境のノイズフロアと比べて適切かどうか(閾値が厳しすぎて小声発話を誤って棄却しないか、緩すぎて環境ノイズのみの録音を通してしまわないか)は、合成フィクスチャでの確認に留まっており実機での様子見が必要です。

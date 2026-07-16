@@ -54,6 +54,9 @@ struct StatusHUDContentView: View {
         case .fallbackWarning:
             Image(systemName: "exclamationmark.triangle.fill")
                 .foregroundStyle(Color.yellow)
+        case .cancelled:
+            Image(systemName: "mic.slash.fill")
+                .foregroundStyle(Color.white.opacity(0.7))
         }
     }
 
@@ -65,6 +68,7 @@ struct StatusHUDContentView: View {
         case .formatting: return "整形中…"
         case .success: return "挿入しました"
         case .fallbackWarning: return "整形なしで挿入"
+        case .cancelled(let message): return message
         }
     }
 

@@ -57,6 +57,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         coordinator.onPhaseChanged = { [weak statusHUDController] phase in
             statusHUDController?.handlePhaseChanged(phase)
         }
+        coordinator.onRecordingSkipped = { [weak statusHUDController] reason in
+            statusHUDController?.reportRecordingSkipped(reason)
+        }
         audioEngine.onLevelUpdate = { [weak statusHUDController] rms in
             statusHUDController?.updateLevel(rms)
         }
@@ -145,6 +148,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 statusBarController?.removeWarning(message)
             }
         }
+
+        // VAD(Voice Activity Detection)モデルが未配置ならバックグラウンドで自動ダウンロードする
+        // (ハルシネーション対策の多層防御のうち、実測で最も効果が高いことを確認した第3層(VAD)を
+        // 大半のユーザー環境でも機能させるため。詳細はVadModelAutoProvisioner.swift参照)。
+        // ベストエフォートで、失敗しても他の初期化・機能には一切影響しない。
+        VadModelAutoProvisioner.provisionIfNeeded()
 
         // タップ設置とprepare()まで済ませる。AlwaysOnモードのエンジン起動は
         // マイク権限確認の完了を待ってから行う(許可前に起動を試みる競合を避けるため)。

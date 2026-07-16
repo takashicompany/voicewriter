@@ -8,7 +8,7 @@ struct TranscriptionSettingsView: View {
     @AppStorage(SettingsKey.sttEngine) private var sttEngine: SttEngineKind = .whisperCpp
     @AppStorage(SettingsKey.sttLanguage) private var sttLanguage: String = "ja"
     @AppStorage(SettingsKey.sttVocabularyHint) private var sttVocabularyHint: String = Settings.defaultVocabularyHint
-    @AppStorage(SettingsKey.vadEnabled) private var vadEnabled: Bool = false
+    @AppStorage(SettingsKey.vadEnabled) private var vadEnabled: Bool = true
 
     @State private var modelIsAvailable = WhisperCppEngine.isModelAvailable()
     @State private var vadModelIsAvailable = WhisperCppEngine.isVadModelAvailable()
@@ -61,9 +61,9 @@ struct TranscriptionSettingsView: View {
                 modelStatusView
             }
 
-            Section("VAD (Voice Activity Detection、実験的)") {
+            Section("VAD (Voice Activity Detection)") {
                 Toggle("VADを有効にする", isOn: $vadEnabled)
-                Text("無音/非音声区間を検出し、発話区間だけをデコードすることでハルシネーションを減らせる場合があります。既定はOFFです。")
+                Text("無音/非音声区間を検出し、発話区間だけをデコードすることでハルシネーション(無音時に定型句が出力される現象)を減らします。既定はONです(無音・誤押下対策の一環)。VADモデルが未配置の場合は自動的に無効として動作します。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

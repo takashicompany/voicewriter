@@ -68,6 +68,9 @@ final class WhisperCppEngine: TranscriptionEngine, @unchecked Sendable {
         return size > 500_000
     }
 
+    /// VAD既定ON化に伴い、モデル未配置環境での警告ログをアプリ寿命中1回だけに抑制するためのフラグ。
+    nonisolated(unsafe) private static var hasWarnedMissingVadModel = false
+
     /// - Parameters:
     ///   - modelURL: ggml-large-v3-turbo.bin 等、ggml形式モデルのパス
     ///   - language: "ja" 等のISO 639-1言語コード、または自動判定の "auto"
@@ -161,17 +164,25 @@ final class WhisperCppEngine: TranscriptionEngine, @unchecked Sendable {
         params.entropy_thold = 2.4
         params.logprob_thold = -1.0
 
-        // suppress_nst(非音声トークン抑制)とno_speech_tholdは、whisper-cliの既定値(false/0.6)ではなく、
-        // 本アプリと同じ「プッシュ・トゥ・トークで短い発話単位を都度デコードする」ユースケースの
-        // 実装であるHandy(cjpais/Handy、内部でcjpais/transcribe-rsのwhisper.cppラッパーを利用)の
-        // 実運用値を採用した。非音声トークンの抑制とno_speech_tholdの引き下げは、いずれも
-        // 無音・ノイズ区間での無関係なトークン出力(ハルシネーション)を抑える方向に働く。
-        // 一次情報: https://github.com/cjpais/transcribe-rs/blob/main/src/whisper_cpp/mod.rs
-        //           (WhisperInferenceParams::default(): suppress_non_speech_tokens=true, no_speech_thold=0.2)
-        //           https://github.com/cjpais/Handy/blob/main/src-tauri/src/managers/transcription.rs
-        //           (initial_promptにユーザー定義語彙をカンマ区切りで渡している箇所。本実装の語彙ヒントも同じ発想)
+        // suppress_nst(非音声トークン抑制)は引き続き有効にする。一方でno_speech_tholdは
+        // whisper-cli既定値の0.6に戻した(以前はHandyの実運用値0.2を採用していたが、
+        // 無音・誤押下ハルシネーション対策の見直しの過程でwhisper.cpp本体のソース
+        // (src/whisper.cpp、`is_no_speech`判定)を確認したところ、no_speech_tholdは単独では
+        // 効かず、`no_speech_prob > no_speech_thold && avg_logprobs < logprob_thold`の
+        // **複合条件**でのみそのセグメントの出力自体を抑制する実装だった。自信を持って
+        // (=avg_logprobsが高いまま)生成されるハルシネーション定型句はこの複合条件の
+        // avg_logprobs側を満たさないため、no_speech_tholdをいくら下げても抑制効果がない
+        // (実測でも、無音のみのWAVに対しno_speech_thold=0.2のままハルシネーションが
+        // 再現することを確認した)。それでいて閾値を下げると、本来は不確実なだけの
+        // 正当な小声発話まで誤って抑制されるリスクだけが増える。そのため、この対策は
+        // VAD(第3層)・エネルギーゲート(第2層)・セグメント単位no_speech_probフィルタ(第4層)・
+        // 既知フレーズフィルタ(第5層)に委ね、no_speech_thold自体はwhisper-cli既定値に戻した。
+        // 一次情報: https://github.com/ggml-org/whisper.cpp/blob/v1.9.1/src/whisper.cpp
+        //   (`is_no_speech = (state->no_speech_prob > params.no_speech_thold &&
+        //     best_decoder.sequence.avg_logprobs < params.logprob_thold)`、
+        //     この条件がtrueの場合のみそのデコード結果を`result_all`へ出力しない)
         params.suppress_nst = true
-        params.no_speech_thold = 0.2
+        params.no_speech_thold = 0.6
 
         // "auto" (または空文字) を渡すとwhisper.cpp側で言語自動判定になる。
         let languageForWhisper: String? = (language == "auto") ? nil : language
@@ -182,19 +193,32 @@ final class WhisperCppEngine: TranscriptionEngine, @unchecked Sendable {
         let vocabularyHint = Settings.sttVocabularyHint.trimmingCharacters(in: .whitespacesAndNewlines)
         let promptForWhisper: String? = vocabularyHint.isEmpty ? nil : vocabularyHint
 
-        // VAD(Voice Activity Detection、既定OFF)。有効化されておりモデルが配置済みの場合のみ使う。
-        // whisper.cpp v1.9.1でwhisper_full_params自体にVADが統合されており、無音/非音声区間を
-        // 検出して発話区間だけをデコードすることで、末尾無音でのハルシネーション
-        // (例: https://github.com/ggml-org/whisper.cpp/issues/1724 )を軽減できるとされる。
+        // ハルシネーション対策(多層防御)の第3層: VAD(Voice Activity Detection、既定ON)。
+        // 有効化されておりモデルが配置済みの場合のみ使う。whisper.cpp v1.9.1で
+        // whisper_full_params自体にVADが統合されており、無音/非音声区間を検出して発話区間だけを
+        // デコードすることで、発話区間が全く検出されなければ空文字を返す(=末尾/全体無音での
+        // ハルシネーション、例: https://github.com/ggml-org/whisper.cpp/issues/1724 を軽減できる)。
         // 一次情報: https://github.com/ggml-org/whisper.cpp/blob/v1.9.1/README.md#voice-activity-detection-vad
         let vadModelPath: String? = Settings.vadEnabled && Self.isVadModelAvailable()
             ? Self.defaultVadModelURL.path
             : nil
         if Settings.vadEnabled, vadModelPath == nil {
-            log.warning("VAD is enabled but model not found at \(Self.defaultVadModelURL.path, privacy: .public); proceeding without VAD")
+            // 既定ONに変更したため、モデル未配置環境では毎回警告が出て冗長になる。
+            // アプリの寿命中に1回だけ出せば十分な情報のため、以後は抑制する。
+            if !Self.hasWarnedMissingVadModel {
+                Self.hasWarnedMissingVadModel = true
+                log.warning("VAD is enabled but model not found at \(Self.defaultVadModelURL.path, privacy: .public); proceeding without VAD (run scripts/download-vad-model.sh to enable)")
+            }
         }
         params.vad = (vadModelPath != nil)
-        params.vad_params = whisper_vad_default_params()
+        var vadParams = whisper_vad_default_params()
+        // speech_pad_ms(検出した発話区間の前後に足す余白)は既定30msから100msへ引き上げた。
+        // VADを既定ONに変更し露出が増えたため、語頭の子音・語尾の音が短く削られて
+        // 認識精度が落ちるリスクを避けるための安全マージンを広めに取った
+        // (他のVADパラメータ(threshold=0.5, min_speech_duration_ms=250,
+        //  min_silence_duration_ms=100)はwhisper.cpp既定値のまま)。
+        vadParams.speech_pad_ms = 100
+        params.vad_params = vadParams
 
         // デバッグ用: 隠し設定が有効な場合、whisper_fullに渡す直前(先頭無音トリム後)の
         // 16kHz/mono/Float32サンプルをWAVとして保存する。公式whisper-cliとの同一入力比較や、
@@ -229,13 +253,50 @@ final class WhisperCppEngine: TranscriptionEngine, @unchecked Sendable {
         let segmentCount = whisper_full_n_segments(context)
         guard segmentCount > 0 else { return "" }
 
-        var text = ""
+        // ハルシネーション対策(多層防御)の第4層: セグメント単位のno_speech_prob(このセグメントが
+        // 無音/非音声である確率)を取得し、閾値以上のセグメントは出力から除外する。
+        // `no_speech_thold`パラメータ(上記、decode時の温度フォールバック判定に使われる)とは別に、
+        // whisper.cpp v1.9.1はセグメントごとの実測確率をAPI越しに公開しており
+        // (`whisper_full_get_segment_no_speech_prob`)、デコード結果に対する後段フィルタとして使える。
+        // 一次情報: vendor/whisper.xcframework内のwhisper.h
+        //   (`WHISPER_API float whisper_full_get_segment_no_speech_prob(...)`、
+        //    コメント「Get the no_speech probability for the specified segment」)
+        var segments: [(text: String, noSpeechProb: Float)] = []
+        segments.reserveCapacity(Int(segmentCount))
         for i in 0..<segmentCount {
-            if let cText = whisper_full_get_segment_text(context, i) {
-                text += String(cString: cText)
-            }
+            let segmentText = whisper_full_get_segment_text(context, i).map { String(cString: $0) } ?? ""
+            let noSpeechProb = whisper_full_get_segment_no_speech_prob(context, i)
+            segments.append((text: segmentText, noSpeechProb: noSpeechProb))
         }
-        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let filtered = Self.filterSegments(segments)
+        if filtered.excludedCount > 0 {
+            log.info("Excluded \(filtered.excludedCount, privacy: .public) of \(segmentCount, privacy: .public) segment(s) with high no_speech_prob (threshold=\(Self.segmentNoSpeechProbThreshold, privacy: .public))")
+        }
+        return filtered.text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// セグメント単位のno_speech_prob(このセグメントが無音/非音声である確率)フィルタの閾値。
+    /// VoiceInk(https://github.com/Beingpax/VoiceInk )の実装調査(値のみ参考、コード引用なし)で
+    /// 60%(0.6)超のセグメントを棄却していることを確認したため、同じ値を採用した。
+    static let segmentNoSpeechProbThreshold: Float = 0.6
+
+    /// `runFull`から分離した純粋関数。セグメント一覧(テキスト・no_speech_prob)を受け取り、
+    /// 閾値以上のno_speech_probを持つセグメントを除外して残りを連結する(単体テスト用に切り出し)。
+    static func filterSegments(
+        _ segments: [(text: String, noSpeechProb: Float)],
+        threshold: Float = segmentNoSpeechProbThreshold
+    ) -> (text: String, excludedCount: Int) {
+        var text = ""
+        var excludedCount = 0
+        for segment in segments {
+            if segment.noSpeechProb >= threshold {
+                excludedCount += 1
+                continue
+            }
+            text += segment.text
+        }
+        return (text, excludedCount)
     }
 }
 

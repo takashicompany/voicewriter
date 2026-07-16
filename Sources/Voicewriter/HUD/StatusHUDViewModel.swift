@@ -10,6 +10,9 @@ enum StatusHUDDisplay: Equatable {
     case formatting
     case success
     case fallbackWarning
+    /// ハルシネーション対策(多層防御)により録音サイクルがスキップされた際の表示。
+    /// `message`は「短すぎるためキャンセル」/「無音のためキャンセル」。
+    case cancelled(message: String)
 }
 
 /// `StatusHUDContentView`が購読するビューモデル。`StatusHUDController`がCoordinator等の

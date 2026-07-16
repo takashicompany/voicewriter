@@ -77,6 +77,23 @@ final class StatusHUDController {
         scheduleAutoHide(after: usedFormattingFallback ? 1.5 : 0.8)
     }
 
+    /// `Coordinator.onRecordingSkipped`から呼ぶ(ハルシネーション対策の多層防御により
+    /// 文字起こし自体がスキップされた場合)。テキスト挿入は行われない。
+    func reportRecordingSkipped(_ reason: RecordingSkipReason) {
+        guard Settings.hudEnabled else { return }
+        autoHideWorkItem?.cancel()
+        let message: String
+        switch reason {
+        case .tooShort:
+            message = "短すぎるためキャンセル"
+        case .silence:
+            message = "無音のためキャンセル"
+        }
+        viewModel.display = .cancelled(message: message)
+        show()
+        scheduleAutoHide(after: 1.0)
+    }
+
     // MARK: - 表示/非表示(フェード)
 
     private func show() {

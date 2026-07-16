@@ -142,13 +142,19 @@ enum Settings {
         return base.appendingPathComponent("Voicewriter/Debug/last-recording.wav", isDirectory: false)
     }
 
-    /// VAD(Voice Activity Detection、既定OFF)を有効にするか。whisper.cpp v1.9.1で
-    /// whisper_full_params自体に統合されたSilero-VADベースの機能で、発話区間だけをデコードする
-    /// ことで無音/非音声区間でのハルシネーションを軽減する狙いがある。有効化してもVADモデル
-    /// (`scripts/download-vad-model.sh`で配置)が無ければ`WhisperCppEngine`が警告ログを出して
-    /// 通常通り(VAD無し)動作する。
+    /// VAD(Voice Activity Detection)を有効にするか。既定ON(無音・誤押下時のハルシネーション対策の
+    /// 一環として、多層防御の第3層に位置づけている)。whisper.cpp v1.9.1で`whisper_full_params`自体に
+    /// 統合されたSilero-VADベースの機能で、発話区間が検出できなければ空文字を返す(=ハルシネーション
+    /// も含め一切出力しない)。有効化していてもVADモデル(`scripts/download-vad-model.sh`で配置)が
+    /// 無ければ`WhisperCppEngine`が警告ログを出してVAD無しで動作する(=この層は事実上スキップされる、
+    /// 安全側のフォールバック)ため、モデル未配置環境でも既定ONにして問題ない。
     static var vadEnabled: Bool {
-        get { UserDefaults.standard.bool(forKey: SettingsKey.vadEnabled) }
+        get {
+            if UserDefaults.standard.object(forKey: SettingsKey.vadEnabled) == nil {
+                return true
+            }
+            return UserDefaults.standard.bool(forKey: SettingsKey.vadEnabled)
+        }
         set { UserDefaults.standard.set(newValue, forKey: SettingsKey.vadEnabled) }
     }
 
