@@ -59,7 +59,41 @@ else
   SIGN_IDENTITY="-"
 fi
 
-echo "==> Code signing (identity: $SIGN_IDENTITY)"
-codesign --force --deep --sign "$SIGN_IDENTITY" "$APP_DIR"
+# Hardened Runtimeの有無:
+# - 既定(VOICEWRITER_HARDENED未指定 or 0)では従来通り付けない(自己署名配布では公証もできず、
+#   Hardened Runtimeを付けてもメリットが無いため)
+# - VOICEWRITER_HARDENED=1 を指定すると `-o runtime` を付け、mainの実行ファイルには
+#   Resources/Voicewriter.entitlements (マイク入力のみ) を紐付ける。将来Apple Developer Program
+#   に加入し公証(notarization)へ移行する際は、正式なDeveloper ID証明書を
+#   VOICEWRITER_SIGN_IDENTITY に指定した上でこのフラグを立てる想定。
+HARDENED="${VOICEWRITER_HARDENED:-0}"
+FRAMEWORK_SIGN_ARGS=()
+APP_SIGN_ARGS=()
+if [[ "$HARDENED" == "1" ]]; then
+  echo "==> Hardened Runtime: enabled (-o runtime)"
+  FRAMEWORK_SIGN_ARGS+=(-o runtime)
+  APP_SIGN_ARGS+=(-o runtime --entitlements "$ROOT_DIR/Resources/Voicewriter.entitlements")
+else
+  echo "==> Hardened Runtime: disabled (default)"
+fi
+
+# コード署名(inside-out): --deep は macOS 13以降 man codesign 上でDEPRECATED指定のため使わない。
+# 代わりにvendor由来のネストしたコード(whisper.frameworkの実体dylib)を先に個別署名し、
+# 最後に.app本体を署名する。既に有効な署名を持つネストしたコードは、.app本体の署名時に
+# (--deepなしでも)そのまま尊重される。
+# 現行のvendor/whisper.xcframeworkは"Versions/A"固定でパスを直書きしている。将来ベンダーの
+# xcframeworkが別バージョン識別子(Versions/B等)を使うようになった場合はこのパスも追随して
+# 更新すること(上のエラーメッセージで検知できる)。
+WHISPER_DYLIB="$FRAMEWORKS_DIR/whisper.framework/Versions/A/whisper"
+if [[ ! -f "$WHISPER_DYLIB" ]]; then
+  echo "error: whisper dylib not found at $WHISPER_DYLIB" >&2
+  exit 1
+fi
+
+echo "==> Code signing whisper.framework dylib (identity: $SIGN_IDENTITY)"
+codesign --force --sign "$SIGN_IDENTITY" "${FRAMEWORK_SIGN_ARGS[@]}" "$WHISPER_DYLIB"
+
+echo "==> Code signing $APP_DIR (identity: $SIGN_IDENTITY)"
+codesign --force --sign "$SIGN_IDENTITY" "${APP_SIGN_ARGS[@]}" "$APP_DIR"
 
 echo "==> Done: $APP_DIR"

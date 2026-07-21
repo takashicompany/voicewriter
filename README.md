@@ -74,6 +74,56 @@ tccutil reset Accessibility dev.voicewriter.app
 
 この後は、新しい証明書で署名され続ける限り、アクセシビリティの許可は再ビルドをまたいで維持されます。
 
+### 署名の内部実装(inside-out signing)
+
+`codesign --deep` はmacOS 13以降 `man codesign` 上でDEPRECATEDと明記されているため、`scripts/build-app.sh`では使用していません。代わりに、vendor由来のネストしたコード(`whisper.framework`内の実体dylib、`Contents/Frameworks/whisper.framework/Versions/A/whisper`)を先に個別に署名し、そのあとで`.app`本体を署名する、Appleが推奨する「inside-out」の順序を採っています。`.app`本体の署名時には`--deep`を付けなくても、既に有効な署名を持つネストしたコードはそのまま尊重されます(検証目的で`codesign --verify --deep --strict`を使うのは問題ありません。DEPRECATEDなのは署名時の`--deep`です)。
+
+将来Hardened RuntimeやApple公証(notarization)へ移行できるよう、署名identityとHardened Runtimeの有無は環境変数で切り替えられる構造にしています。
+
+- `VOICEWRITER_SIGN_IDENTITY`: 署名に使うidentity(既定は上記の優先順位ロジックで決定)
+- `VOICEWRITER_HARDENED=1`: Hardened Runtime(`-o runtime`)を有効化し、`.app`本体に`Resources/Voicewriter.entitlements`(マイク入力のみ、`com.apple.security.device.audio-input`)を紐付ける。既定(未指定または`0`)ではHardened Runtimeを付けない(自己署名・未公証の配布ではメリットが無いため)。
+
+```sh
+# 将来、正式なDeveloper ID証明書で公証に備えたビルドを試す場合の例
+VOICEWRITER_SIGN_IDENTITY="Developer ID Application: ..." VOICEWRITER_HARDENED=1 ./scripts/build-app.sh release
+```
+
+なお、macOSのアクセシビリティ機能はentitlement宣言の対象ではなく、TCC(ユーザーによる許可ダイアログ)のみで制御されるため、`Voicewriter.entitlements`にはアクセシビリティ関連のキーは含めていません。
+
+## 配布(Apple Developer Program未加入での無料配布)
+
+現時点ではApple Developer Programに加入しておらず、Appleの公証(notarization)を受けていません。そのため、上記の自己署名証明書("Voicewriter Dev Signing")での配布を前提とします(この証明書がキーチェーンに無いビルド環境では`scripts/build-app.sh`が従来通りアドホック署名にフォールバックしますが、配布用ビルドでは`./scripts/create-signing-identity.sh`で証明書を用意した環境で`scripts/package-release.sh`を実行してください)。受け取ったユーザーはGatekeeperの警告を手動で回避する操作が必要です(詳細は[INSTALL.md](INSTALL.md)を参照)。
+
+### 配布パッケージの作成
+
+```sh
+./scripts/package-release.sh          # Info.plistのCFBundleShortVersionStringをバージョンとして使用
+./scripts/package-release.sh 1.2.0    # バージョンを明示指定
+```
+
+`scripts/package-release.sh`は以下を行います。
+
+1. バージョン番号の決定(引数 > `Resources/Info.plist`の`CFBundleShortVersionString` > 未設定なら`1.0.0`を書き込んで使用)。決定したバージョンが`Resources/Info.plist`の値と異なる場合は、ビルド前にそこへ書き戻す(zipファイル名とアプリ内`CFBundleShortVersionString`を一致させるため。`PlistBuddy`での書き戻し時、plist全体がキー順・インデントで再整形される点に注意)
+2. `scripts/build-app.sh release`でreleaseビルドの`.app`を作成
+3. `ditto -c -k --keepParent build/Voicewriter.app dist/Voicewriter-vX.Y.Z.zip`でZIP化(`ditto`は拡張属性・コード署名を保持したままZIP化できるため、macOSアプリの配布には`zip`コマンドより適している)
+4. 生成したZIPのSHA-256を出力(受け取り側が改ざん確認・受け渡し時の照合に使える)
+
+`dist/`は`.gitignore`対象です。バージョン引数を使ってリリースした場合、`Resources/Info.plist`の変更をコミットする前に`git diff`で意図した差分のみになっているか確認してください。
+
+### 受け取り側への案内
+
+生成した`Voicewriter-vX.Y.Z.zip`と併せて、[INSTALL.md](INSTALL.md)を配布してください。`/Applications`への配置、初回起動時のGatekeeper操作(システム設定 > プライバシーとセキュリティ > 「このまま開く」)、「壊れているため開けません」と表示された場合の隔離属性除去(`xattr -dr com.apple.quarantine`)、マイク・アクセシビリティ権限の許可手順、初回起動時のwhisperモデル(約1.6GB)のダウンロード手順、LLM整形を使う場合の任意のOllamaセットアップ手順をまとめています。
+
+### 将来の公証(notarization)への移行手順の要約
+
+Apple Developer Program(年額)に加入した場合、以下の流れで公証済み配布へ移行できます。
+
+1. Apple Developer Programに登録し、Developer ID Application証明書を取得してキーチェーンに導入する。
+2. `VOICEWRITER_SIGN_IDENTITY="Developer ID Application: ..."`と`VOICEWRITER_HARDENED=1`を指定して`scripts/build-app.sh release`を実行する(Hardened Runtime化・entitlements付与は本対応で既に切替可能な構造にしてある)。**ただし公証には署名にタイムスタンプ(`--timestamp`)が必須**であり、現状の`scripts/build-app.sh`の`codesign`呼び出しにはこのオプションが無いため、公証に対応する際は`codesign`呼び出しへ`--timestamp`を追加する変更が別途必要(自己署名証明書はタイムスタンプ局と通信できないため、既定では付けていない)。
+3. `.app`を`ditto`でZIP化し、`xcrun notarytool submit ... --wait`でAppleの公証サービスに提出する(Apple IDのApp用パスワードまたはApp Store Connect API Keyが必要)。
+4. 公証が通ったら`xcrun stapler staple build/Voicewriter.app`でチケットをアプリに添付してから配布ZIPを作成する(`scripts/package-release.sh`は内部で`build-app.sh`を再実行するため、staple後にそのまま使うとstaple前の`.app`で再ビルド・上書きしてしまう。stapleを含める場合は`package-release.sh`のビルド呼び出しをスキップし、`ditto -c -k --keepParent`のZIP化のみ別途実行すること)。
+5. これにより受け取り側のGatekeeper警告・手動回避操作(INSTALL.mdの「初回起動」節)は不要になる。
+
 ## whisper.cpp統合
 
 ### xcframeworkの取得方法
