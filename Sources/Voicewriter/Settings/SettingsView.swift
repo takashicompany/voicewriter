@@ -25,6 +25,9 @@ struct SettingsView: View {
             FormattingSettingsView()
                 .tabItem { Label("整形", systemImage: "wand.and.stars") }
 
+            DictionarySettingsView()
+                .tabItem { Label("辞書", systemImage: "character.book.closed") }
+
             GeneralSettingsView()
                 .tabItem { Label("一般", systemImage: "gearshape") }
         }

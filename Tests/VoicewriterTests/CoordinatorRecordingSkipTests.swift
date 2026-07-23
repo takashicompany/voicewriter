@@ -62,7 +62,7 @@ final class CoordinatorRecordingSkipTests: XCTestCase {
         // 押下から離すまでを0.1秒(閾値0.3秒未満)としてシミュレートする。
         let clock = FakeClock(step: 0.1)
         let textInserter = FakeTextInserter()
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textInserter: textInserter, now: clock.now)
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textInserter: textInserter, now: clock.now, dictionaryProvider: { [] })
 
         var committed: [DictationJobCommitEvent] = []
         coordinator.onJobCommitted = { _, result in committed.append(result) }
@@ -88,7 +88,7 @@ final class CoordinatorRecordingSkipTests: XCTestCase {
         // 押下から離すまでを1秒(閾値は十分満たす)としてシミュレートする。
         let clock = FakeClock(step: 1.0)
         let textInserter = FakeTextInserter()
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textInserter: textInserter, now: clock.now)
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textInserter: textInserter, now: clock.now, dictionaryProvider: { [] })
 
         var committed: [DictationJobCommitEvent] = []
         coordinator.onJobCommitted = { _, result in committed.append(result) }
@@ -113,7 +113,7 @@ final class CoordinatorRecordingSkipTests: XCTestCase {
         let transcriptionEngine = RecordingCountingTranscriptionEngine(text: "こんにちは、今日は良い天気ですね")
         let clock = FakeClock(step: 1.0)
         let textInserter = FakeTextInserter()
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textInserter: textInserter, now: clock.now)
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textInserter: textInserter, now: clock.now, dictionaryProvider: { [] })
 
         var committed: [DictationJobCommitEvent] = []
         coordinator.onJobCommitted = { _, result in committed.append(result) }
@@ -140,7 +140,7 @@ final class CoordinatorRecordingSkipTests: XCTestCase {
         let transcriptionEngine = RecordingCountingTranscriptionEngine(text: "ご視聴ありがとうございました。")
         let clock = FakeClock(step: 1.0)
         let textInserter = FakeTextInserter()
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textInserter: textInserter, now: clock.now)
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textInserter: textInserter, now: clock.now, dictionaryProvider: { [] })
 
         var committed: [DictationJobCommitEvent] = []
         coordinator.onJobCommitted = { _, result in committed.append(result) }
@@ -168,7 +168,7 @@ final class CoordinatorRecordingSkipTests: XCTestCase {
         let transcriptionEngine = RecordingCountingTranscriptionEngine(text: realSpeechWithPhrase)
         let clock = FakeClock(step: 1.0)
         let textInserter = FakeTextInserter()
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textInserter: textInserter, now: clock.now)
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textInserter: textInserter, now: clock.now, dictionaryProvider: { [] })
 
         var committed: [DictationJobCommitEvent] = []
         coordinator.onJobCommitted = { _, result in committed.append(result) }
@@ -204,7 +204,7 @@ final class CoordinatorRecordingSkipTests: XCTestCase {
         let transcriptionEngine = RecordingCountingTranscriptionEngine()
         let clock = FakeClock(step: 1.0)
         let textInserter = FakeTextInserter()
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textInserter: textInserter, now: clock.now)
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textInserter: textInserter, now: clock.now, dictionaryProvider: { [] })
 
         await coordinator.beginPushToTalk()
         // 録音中に設定を変更する(待ち行列中の設定変更を模す)。

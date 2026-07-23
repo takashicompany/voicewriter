@@ -89,7 +89,7 @@ final class CoordinatorCancelDuringTranscribingTests: XCTestCase {
         let transcriptionEngine = ControllableTranscriptionEngine()
         let clock = FakeClock()
         let textInserter = FakeTextInserter()
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textInserter: textInserter, now: clock.now)
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textInserter: textInserter, now: clock.now, dictionaryProvider: { [] })
 
         var committed: [DictationJobCommitEvent] = []
         coordinator.onJobCommitted = { _, result in committed.append(result) }
@@ -134,7 +134,7 @@ final class CoordinatorCancelDuringTranscribingTests: XCTestCase {
         let transcriptionEngine = ControllableTranscriptionEngine()
         let clock = FakeClock()
         let textInserter = FakeTextInserter()
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textInserter: textInserter, now: clock.now)
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textInserter: textInserter, now: clock.now, dictionaryProvider: { [] })
 
         var committed: [DictationJobCommitEvent] = []
         coordinator.onJobCommitted = { _, result in committed.append(result) }

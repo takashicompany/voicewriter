@@ -96,7 +96,7 @@ private actor ControllableTextInserter: TextInserting {
 final class CoordinatorModelSetupBlockingTests: XCTestCase {
     func testBeginPushToTalkIsRejectedWhileModelSetupIsBlocking() async {
         let audioEngine = CountingFakeAudioCaptureEngine()
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: ImmediateTranscriptionEngine(), now: FakeClock().now)
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: ImmediateTranscriptionEngine(), now: FakeClock().now, dictionaryProvider: { [] })
         coordinator.isModelSetupBlocking = true
 
         var rejectedCount = 0
@@ -111,7 +111,7 @@ final class CoordinatorModelSetupBlockingTests: XCTestCase {
 
     func testToggleRecordingIsRejectedWhileModelSetupIsBlocking() async {
         let audioEngine = CountingFakeAudioCaptureEngine()
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: ImmediateTranscriptionEngine(), now: FakeClock().now)
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: ImmediateTranscriptionEngine(), now: FakeClock().now, dictionaryProvider: { [] })
         coordinator.isModelSetupBlocking = true
 
         var rejectedCount = 0
@@ -126,7 +126,7 @@ final class CoordinatorModelSetupBlockingTests: XCTestCase {
 
     func testRecordingProceedsNormallyOnceSetupBlockingIsCleared() async {
         let audioEngine = CountingFakeAudioCaptureEngine()
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: ImmediateTranscriptionEngine(), now: FakeClock().now)
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: ImmediateTranscriptionEngine(), now: FakeClock().now, dictionaryProvider: { [] })
         coordinator.isModelSetupBlocking = true
         coordinator.isModelSetupBlocking = false
 
@@ -145,7 +145,7 @@ final class CoordinatorModelSetupBlockingTests: XCTestCase {
     /// 停止は`attemptStartRecording`を経由しないため、ゲートの影響を受けないことを確認する。
     func testToggleStopIsNotBlockedWhileModelSetupIsBlocking() async {
         let audioEngine = CountingFakeAudioCaptureEngine()
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: ImmediateTranscriptionEngine(), textInserter: FakeTextInserter(), now: FakeClock().now)
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: ImmediateTranscriptionEngine(), textInserter: FakeTextInserter(), now: FakeClock().now, dictionaryProvider: { [] })
 
         // トグルで録音を開始する(セットアップ開始前)。
         await coordinator.toggleRecording()
@@ -174,7 +174,7 @@ final class CoordinatorModelSetupBlockingTests: XCTestCase {
         let audioEngine = CountingFakeAudioCaptureEngine()
         let transcriptionEngine = ImmediateTranscriptionEngine(text: "job one")
         let textInserter = FakeTextInserter()
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textInserter: textInserter, now: FakeClock().now)
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textInserter: textInserter, now: FakeClock().now, dictionaryProvider: { [] })
 
         // ジョブ#1: 録音・停止(finalizingグレー待ちに入る。まだdidFinishRecordingは届いていない)。
         await coordinator.beginPushToTalk()
@@ -210,7 +210,7 @@ final class CoordinatorModelSetupBlockingTests: XCTestCase {
         let audioEngine = CountingFakeAudioCaptureEngine()
         let transcriptionEngine = ImmediateTranscriptionEngine(text: "job one")
         let textInserter = ControllableTextInserter()
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textInserter: textInserter, now: FakeClock().now)
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textInserter: textInserter, now: FakeClock().now, dictionaryProvider: { [] })
 
         // ジョブ#1: 録音・停止・認識完了→挿入クリティカル区間に入る(Cmd+V送出前で止めておく)。
         await coordinator.beginPushToTalk()

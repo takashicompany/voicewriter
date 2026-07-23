@@ -159,7 +159,7 @@ final class CoordinatorFormattingTests: XCTestCase {
         let formatter = FixedTextFormatter(outcome: .success("こんにちは。"))
         let clock = FakeClock()
         let textInserter = FakeTextInserter()
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter, textInserter: textInserter, now: clock.now)
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter, textInserter: textInserter, now: clock.now, dictionaryProvider: { [] })
 
         await coordinator.beginPushToTalk()
         coordinator.endPushToTalk()
@@ -179,7 +179,7 @@ final class CoordinatorFormattingTests: XCTestCase {
         let formatter = FixedTextFormatter(outcome: .failure(FakeFormatterError.boom))
         let clock = FakeClock()
         let textInserter = FakeTextInserter()
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter, textInserter: textInserter, now: clock.now)
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter, textInserter: textInserter, now: clock.now, dictionaryProvider: { [] })
 
         var formattingFailedMessages: [String] = []
         coordinator.onFormattingFailed = { formattingFailedMessages.append($0) }
@@ -204,7 +204,7 @@ final class CoordinatorFormattingTests: XCTestCase {
         let formatter = FixedTextFormatter(outcome: .failure(FakeFormatterError.boom))
         let clock = FakeClock()
         let textInserter = FakeTextInserter()
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter, textInserter: textInserter, now: clock.now)
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter, textInserter: textInserter, now: clock.now, dictionaryProvider: { [] })
 
         var formattingFailedCount = 0
         coordinator.onFormattingFailed = { _ in formattingFailedCount += 1 }
@@ -231,7 +231,7 @@ final class CoordinatorFormattingTests: XCTestCase {
         let formatter = ControllableTextFormatter()
         let clock = FakeClock()
         let textInserter = FakeTextInserter()
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter, textInserter: textInserter, now: clock.now)
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter, textInserter: textInserter, now: clock.now, dictionaryProvider: { [] })
 
         await coordinator.beginPushToTalk()
         coordinator.endPushToTalk()
@@ -276,7 +276,7 @@ final class CoordinatorFormattingTests: XCTestCase {
         let formatter = ControllableTextFormatter()
         let clock = FakeClock()
         let textInserter = FakeTextInserter()
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter, textInserter: textInserter, now: clock.now)
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter, textInserter: textInserter, now: clock.now, dictionaryProvider: { [] })
 
         await coordinator.beginPushToTalk()
         coordinator.endPushToTalk()
@@ -309,7 +309,7 @@ final class CoordinatorFormattingTests: XCTestCase {
         let formatter = ControllableTextFormatter()
         let clock = FakeClock()
         let textInserter = FakeTextInserter()
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter, textInserter: textInserter, now: clock.now)
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter, textInserter: textInserter, now: clock.now, dictionaryProvider: { [] })
 
         await coordinator.beginPushToTalk()
         // 録音中に設定を変更する(待ち行列中の設定変更を模す)。
@@ -339,7 +339,7 @@ final class CoordinatorFormattingTests: XCTestCase {
         let formatter = CancellationAwareTextFormatter()
         let clock = FakeClock()
         let textInserter = FakeTextInserter()
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter, textInserter: textInserter, now: clock.now)
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter, textInserter: textInserter, now: clock.now, dictionaryProvider: { [] })
 
         var committed: [DictationJobCommitEvent] = []
         coordinator.onJobCommitted = { _, result in committed.append(result) }
@@ -383,7 +383,7 @@ final class CoordinatorFormattingTests: XCTestCase {
         let formatter = FixedTextFormatter(outcome: .failure(TextFormatterError.serverUnavailable("connection refused")))
         let clock = FakeClock()
         let textInserter = FakeTextInserter()
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter, textInserter: textInserter, now: clock.now)
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter, textInserter: textInserter, now: clock.now, dictionaryProvider: { [] })
 
         var formattingFailedCount = 0
         coordinator.onFormattingFailed = { _ in formattingFailedCount += 1 }
@@ -412,7 +412,7 @@ final class CoordinatorFormattingTests: XCTestCase {
         let formatter = FixedTextFormatter(outcome: .success("こんにちは。"))
         let clock = FakeClock()
         let textInserter = FakeTextInserter()
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter, textInserter: textInserter, now: clock.now)
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter, textInserter: textInserter, now: clock.now, dictionaryProvider: { [] })
 
         var formattingRecoveredCount = 0
         coordinator.onFormattingRecovered = { formattingRecoveredCount += 1 }
@@ -437,7 +437,7 @@ final class CoordinatorFormattingTests: XCTestCase {
         let formatter = FixedTextFormatter(outcome: .success("こんにちは。"))
         let clock = FakeClock()
         let textInserter = FakeTextInserter()
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter, textInserter: textInserter, now: clock.now)
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter, textInserter: textInserter, now: clock.now, dictionaryProvider: { [] })
 
         var phases: [TranscriptionPhase] = []
         coordinator.onPhaseChanged = { phases.append($0) }
@@ -461,7 +461,7 @@ final class CoordinatorFormattingTests: XCTestCase {
         let formatter = FixedTextFormatter(outcome: .failure(FakeFormatterError.boom))
         let clock = FakeClock()
         let textInserter = FakeTextInserter()
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter, textInserter: textInserter, now: clock.now)
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter, textInserter: textInserter, now: clock.now, dictionaryProvider: { [] })
 
         var phases: [TranscriptionPhase] = []
         coordinator.onPhaseChanged = { phases.append($0) }

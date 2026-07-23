@@ -31,15 +31,26 @@ struct DictationJobSettingsSnapshot: Sendable, Equatable {
     var formattingModel: String
     /// LLM整形リクエストのタイムアウト秒数。`TextFormatter.format`へ呼び出しごとの引数として渡す。
     var formattingTimeoutSeconds: Double
+    /// 録音開始時点のユーザー辞書(置換ルール)スナップショット。`Coordinator.runJob`の最終段
+    /// (LLM整形の後、整形無効/失敗時はwhisper生出力の後)で`UserDictionaryReplacer.apply`により
+    /// 適用する。待ち行列中の辞書編集(設定画面の「辞書」タブ)が、既に録音済みのジョブに
+    /// 影響しないようにするため、他の設定値と同様に録音開始時点のスナップショットとして持つ。
+    var dictionaryRules: [UserDictionaryRule]
 
-    static func captureCurrent() -> DictationJobSettingsSnapshot {
+    /// - Parameter dictionaryRules: 録音開始時点のユーザー辞書ルール一覧。呼び出し元
+    ///   (`Coordinator`)が`dictionaryProvider`(既定は`UserDictionaryStore.shared`を読む)経由で
+    ///   取得した値をそのまま渡す。この関数自体はファイル/ObservableObjectに触れない純粋関数のまま
+    ///   にしておくことで、テストから実ファイル(`~/Library/Application Support/...`)へ触れずに
+    ///   辞書の内容を制御できるようにしている。
+    static func captureCurrent(dictionaryRules: [UserDictionaryRule]) -> DictationJobSettingsSnapshot {
         DictationJobSettingsSnapshot(
             sttLanguage: Settings.sttLanguage,
-            vocabularyHint: Settings.sttVocabularyHint,
+            vocabularyHint: DictionaryVocabularyHint.merge(baseHint: Settings.sttVocabularyHint, rules: dictionaryRules),
             vadEnabled: Settings.vadEnabled,
             formattingEnabled: Settings.formattingEnabled,
             formattingModel: Settings.formattingModel,
-            formattingTimeoutSeconds: Settings.formattingTimeoutSeconds
+            formattingTimeoutSeconds: Settings.formattingTimeoutSeconds,
+            dictionaryRules: dictionaryRules
         )
     }
 }

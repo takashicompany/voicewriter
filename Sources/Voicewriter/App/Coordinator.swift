@@ -177,6 +177,11 @@ final class Coordinator: AudioCaptureEngineDelegate {
     /// (`minimumEffectiveRecordingDuration`自体は変更せず、時刻の取得元だけを注入する設計)。
     private let now: () -> Date
     private let maxUnterminatedJobs: Int
+    /// 録音開始時点のユーザー辞書(置換ルール)スナップショットを取得するためのクロージャ。既定は
+    /// `UserDictionaryStore.shared`(実ファイル`~/Library/Application Support/Voicewriter/
+    /// dictionary.json`を永続化元とするObservableObject)を読む。`now: () -> Date`と同じ設計方針で、
+    /// テストからは実ファイルへ一切触れずに辞書の内容を制御できるよう差し替え可能にしている。
+    private let dictionaryProvider: @MainActor () -> [UserDictionaryRule]
 
     init(
         audioEngine: AudioCaptureEngineControlling,
@@ -184,13 +189,15 @@ final class Coordinator: AudioCaptureEngineDelegate {
         textFormatter: TextFormatter? = nil,
         textInserter: TextInserting? = nil,
         now: @escaping () -> Date = Date.init,
-        maxUnterminatedJobs: Int? = nil
+        maxUnterminatedJobs: Int? = nil,
+        dictionaryProvider: @escaping @MainActor () -> [UserDictionaryRule] = { UserDictionaryStore.shared.dictionary.rules }
     ) {
         self.audioEngine = audioEngine
         self.transcriptionEngine = transcriptionEngine
         self.textFormatter = textFormatter
         self.now = now
         self.maxUnterminatedJobs = maxUnterminatedJobs ?? Self.maxUnterminatedJobs
+        self.dictionaryProvider = dictionaryProvider
         self.deliveryCoordinator = DeliveryCoordinator(registry: jobRegistry, textInserter: textInserter ?? TextInserter())
         self.audioEngine.delegate = self
         self.deliveryCoordinator.onCommitted = { [weak self] sequence, result in
@@ -387,7 +394,7 @@ final class Coordinator: AudioCaptureEngineDelegate {
         activationSource = source
         recordingFrontmostApp = NSWorkspace.shared.frontmostApplication
         recordingStartedAt = now()
-        pendingJobSettingsSnapshot = .captureCurrent()
+        pendingJobSettingsSnapshot = .captureCurrent(dictionaryRules: dictionaryProvider())
         currentRecordingSequence = jobRegistry.beginJob()
         recordingState = .recording
         onPendingJobCountChanged?(jobRegistry.activeCount)
@@ -446,7 +453,7 @@ final class Coordinator: AudioCaptureEngineDelegate {
 
             let frontmostAppAtRecordingStart = recordingFrontmostApp
             let effectiveDuration = recordingStartedAt.map { now().timeIntervalSince($0) } ?? .infinity
-            let settingsSnapshot = pendingJobSettingsSnapshot ?? .captureCurrent()
+            let settingsSnapshot = pendingJobSettingsSnapshot ?? .captureCurrent(dictionaryRules: dictionaryProvider())
             // 仕様通り、sequenceは録音開始時(attemptStartRecording)に既に採番済み。
             // 万一nilの場合(理論上到達しないはずだが、安全側のフォールバック)はここで採番する。
             let sequence = currentRecordingSequence ?? {
@@ -638,7 +645,13 @@ final class Coordinator: AudioCaptureEngineDelegate {
                 return
             }
 
-            complete(.insertText(finalText, usedFormattingFallback: usedFormattingFallback))
+            // ユーザー辞書(置換ルール)は、LLM整形の有無に関わらず適用される独立レイヤーとして
+            // パイプラインの最終段(整形後、整形無効/失敗時はwhisper生出力の後)で適用する。
+            // 録音開始時点のスナップショット(`job.settings.dictionaryRules`)を使うため、
+            // 処理中の辞書編集がこのジョブに影響することはない。
+            let dictionaryAppliedText = UserDictionaryReplacer.apply(job.settings.dictionaryRules, to: finalText)
+
+            complete(.insertText(dictionaryAppliedText, usedFormattingFallback: usedFormattingFallback))
         } catch {
             log.error("Transcription failed (sequence \(job.sequence, privacy: .public)): \(error.localizedDescription, privacy: .public)")
             complete(.tombstone(.failed))

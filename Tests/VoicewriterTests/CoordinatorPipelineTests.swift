@@ -133,7 +133,7 @@ final class CoordinatorPipelineTests: XCTestCase {
         let transcriptionEngine = MultiCallTranscriptionEngine()
         let clock = FakeClock()
         let textInserter = FakeTextInserter()
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textInserter: textInserter, now: clock.now)
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textInserter: textInserter, now: clock.now, dictionaryProvider: { [] })
 
         var queueFullCount = 0
         coordinator.onQueueFull = { queueFullCount += 1 }
@@ -159,7 +159,7 @@ final class CoordinatorPipelineTests: XCTestCase {
         let transcriptionEngine = MultiCallTranscriptionEngine()
         let clock = FakeClock()
         let textInserter = FakeTextInserter()
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textInserter: textInserter, now: clock.now)
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textInserter: textInserter, now: clock.now, dictionaryProvider: { [] })
 
         var committed: [(Int, DictationJobCommitEvent)] = []
         coordinator.onJobCommitted = { sequence, result in committed.append((sequence, result)) }
@@ -198,7 +198,7 @@ final class CoordinatorPipelineTests: XCTestCase {
         let transcriptionEngine = MultiCallTranscriptionEngine()
         let clock = FakeClock()
         let textInserter = FakeTextInserter()
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textInserter: textInserter, now: clock.now)
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textInserter: textInserter, now: clock.now, dictionaryProvider: { [] })
 
         var committed: [DictationJobCommitEvent] = []
         coordinator.onJobCommitted = { _, result in committed.append(result) }
@@ -237,7 +237,8 @@ final class CoordinatorPipelineTests: XCTestCase {
             transcriptionEngine: transcriptionEngine,
             textInserter: textInserter,
             now: clock.now,
-            maxUnterminatedJobs: 2
+            maxUnterminatedJobs: 2,
+            dictionaryProvider: { [] }
         )
 
         var queueFullCount = 0
@@ -272,7 +273,7 @@ final class CoordinatorPipelineTests: XCTestCase {
         let transcriptionEngine = MultiCallTranscriptionEngine()
         let clock = FakeClock()
         let textInserter = FakeTextInserter()
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textInserter: textInserter, now: clock.now)
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textInserter: textInserter, now: clock.now, dictionaryProvider: { [] })
 
         await coordinator.beginPushToTalk()
         XCTAssertEqual(audioEngine.startRecordingCallCount, 1)
@@ -301,7 +302,7 @@ final class CoordinatorPipelineTests: XCTestCase {
         let transcriptionEngine = MultiCallTranscriptionEngine()
         let clock = FakeClock()
         let textInserter = FakeTextInserter()
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textInserter: textInserter, now: clock.now)
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textInserter: textInserter, now: clock.now, dictionaryProvider: { [] })
 
         var committed: [(Int, DictationJobCommitEvent)] = []
         coordinator.onJobCommitted = { sequence, result in committed.append((sequence, result)) }
@@ -355,7 +356,8 @@ final class CoordinatorPipelineTests: XCTestCase {
             transcriptionEngine: transcriptionEngine,
             textInserter: textInserter,
             now: clock.now,
-            maxUnterminatedJobs: 2
+            maxUnterminatedJobs: 2,
+            dictionaryProvider: { [] }
         )
 
         var queueFullCount = 0
@@ -408,7 +410,7 @@ final class CoordinatorPipelineTests: XCTestCase {
         let transcriptionEngine = MultiCallTranscriptionEngine()
         let clock = FakeClock()
         let textInserter = FakeTextInserter()
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textInserter: textInserter, now: clock.now)
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textInserter: textInserter, now: clock.now, dictionaryProvider: { [] })
 
         // ジョブ#1: 録音・停止(finalizingグレー待ちに入る。まだdidFinishRecordingは届いていない)。
         await coordinator.beginPushToTalk()
@@ -437,7 +439,7 @@ final class CoordinatorPipelineTests: XCTestCase {
         let transcriptionEngine = MultiCallTranscriptionEngine()
         let clock = FakeClock()
         let textInserter = ControllableTextInserter()
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textInserter: textInserter, now: clock.now)
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textInserter: textInserter, now: clock.now, dictionaryProvider: { [] })
 
         // ジョブ#1: 録音・停止・認識完了→挿入クリティカル区間に入る(Cmd+V送出前で止めておく)。
         await coordinator.beginPushToTalk()
@@ -475,7 +477,7 @@ final class CoordinatorPipelineTests: XCTestCase {
         let transcriptionEngine = MultiCallTranscriptionEngine()
         let clock = FakeClock()
         let textInserter = FakeTextInserter()
-        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textInserter: textInserter, now: clock.now)
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textInserter: textInserter, now: clock.now, dictionaryProvider: { [] })
 
         var committed: [(Int, DictationJobCommitEvent)] = []
         coordinator.onJobCommitted = { sequence, result in committed.append((sequence, result)) }
