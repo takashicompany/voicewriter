@@ -6,6 +6,8 @@
 	<string>Voicewriter</string>
 	<key>CFBundleExecutable</key>
 	<string>Voicewriter</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
 	<string>dev.voicewriter.app</string>
 	<key>CFBundleName</key>

@@ -90,6 +90,48 @@ VOICEWRITER_SIGN_IDENTITY="Developer ID Application: ..." VOICEWRITER_HARDENED=1
 
 なお、macOSのアクセシビリティ機能はentitlement宣言の対象ではなく、TCC(ユーザーによる許可ダイアログ)のみで制御されるため、`Voicewriter.entitlements`にはアクセシビリティ関連のキーは含めていません。
 
+## アプリアイコン
+
+- **採用デザイン**: 藍(インディゴ)の単色フラットな角丸スクワークルに白グリフを乗せたデザイン。元素材は`assets/icon-drafts/bg-variants/bg-08.png`(1024x1024、フルブリード、四隅は透明)です。
+- **macOSの慣例(Big Sur以降)への対応**: 1024x1024のキャンバスに対しアイコン本体は中央の約824x824に収め、周囲約100pxを透明マージンにするのがmacOSの流儀です。`bg-08.png`はフルブリードのため、そのままでは他アプリと並べたときだけ大きく見えてしまいます。そこで`bg-08.png`を一様スケールで824x824に縮小し、1024x1024の透明キャンバス中央に配置したものを中間素材として`Resources/AppIcon/AppIcon-1024-margin.png`に置いています(エッジのアルファは1px以内でのシャープな遷移を維持、ドロップシャドウなし)。
+- **`.icns`の生成元**: `Resources/AppIcon/AppIcon-1024-margin.png`から`sips`で16/32/64/128/256/512/1024pxの各PNG(`Resources/AppIcon/AppIcon.iconset/`)を書き出し、`iconutil -c icns`で`Resources/AppIcon.icns`を生成しています。
+
+### 再生成手順
+
+デザインを差し替える場合は、1024x1024・フルブリード・透明四隅のPNGを用意した上で以下を実行してください。
+
+```sh
+# 1. 824x824へ一様スケールし、1024x1024の透明キャンバス中央に配置(一様スケールのみ、シャープなアルファ遷移を維持)
+python3 -c "
+from PIL import Image
+src = Image.open('assets/icon-drafts/bg-variants/bg-08.png').convert('RGBA')
+resized = src.resize((824, 824), Image.LANCZOS)
+canvas = Image.new('RGBA', (1024, 1024), (0, 0, 0, 0))
+canvas.paste(resized, (100, 100), resized)
+canvas.save('Resources/AppIcon/AppIcon-1024-margin.png')
+"
+
+# 2. iconset(16/32/64/128/256/512/1024pxの@1x/@2x)を書き出し
+SRC="Resources/AppIcon/AppIcon-1024-margin.png"
+ICONSET="Resources/AppIcon/AppIcon.iconset"
+rm -rf "$ICONSET" && mkdir -p "$ICONSET"
+sips -z 16 16     "$SRC" --out "$ICONSET/icon_16x16.png"
+sips -z 32 32     "$SRC" --out "$ICONSET/icon_16x16@2x.png"
+sips -z 32 32     "$SRC" --out "$ICONSET/icon_32x32.png"
+sips -z 64 64     "$SRC" --out "$ICONSET/icon_32x32@2x.png"
+sips -z 128 128   "$SRC" --out "$ICONSET/icon_128x128.png"
+sips -z 256 256   "$SRC" --out "$ICONSET/icon_128x128@2x.png"
+sips -z 256 256   "$SRC" --out "$ICONSET/icon_256x256.png"
+sips -z 512 512   "$SRC" --out "$ICONSET/icon_256x256@2x.png"
+sips -z 512 512   "$SRC" --out "$ICONSET/icon_512x512.png"
+sips -z 1024 1024 "$SRC" --out "$ICONSET/icon_512x512@2x.png"
+
+# 3. .icnsを生成
+iconutil -c icns "Resources/AppIcon/AppIcon.iconset" -o "Resources/AppIcon.icns"
+```
+
+`Resources/Info.plist`の`CFBundleIconFile`は`AppIcon`(拡張子なし)を指しており、`scripts/build-app.sh`が`Resources/AppIcon.icns`を`Contents/Resources/AppIcon.icns`へコピーします。アイコンを差し替えた場合は`Resources/AppIcon.icns`を再生成した上で`./scripts/build-app.sh release`を実行してください。
+
 ## 配布(Apple Developer Program未加入での無料配布)
 
 現時点ではApple Developer Programに加入しておらず、Appleの公証(notarization)を受けていません。そのため、上記の自己署名証明書("Voicewriter Dev Signing")での配布を前提とします(この証明書がキーチェーンに無いビルド環境では`scripts/build-app.sh`が従来通りアドホック署名にフォールバックしますが、配布用ビルドでは`./scripts/create-signing-identity.sh`で証明書を用意した環境で`scripts/package-release.sh`を実行してください)。受け取ったユーザーはGatekeeperの警告を手動で回避する操作が必要です(詳細は[INSTALL.md](INSTALL.md)を参照)。
@@ -276,12 +318,13 @@ tccutil reset Microphone dev.voicewriter.app
 
 ## 設定画面
 
-メニューバーの「設定...」(⌘,)からSwiftUI製の設定ウィンドウを開けます。このアプリは`LSUIElement=true`(Dockアイコン無し)のため、ウィンドウを開くたびに`NSApp.activate` + `makeKeyAndOrderFront`で明示的に前面化しています(`Sources/Voicewriter/App/SettingsWindowController.swift`)。5つのタブで構成されます(`Sources/Voicewriter/Settings/`)。
+メニューバーの「設定...」(⌘,)からSwiftUI製の設定ウィンドウを開けます。このアプリは`LSUIElement=true`(Dockアイコン無し)のため、ウィンドウを開くたびに`NSApp.activate` + `makeKeyAndOrderFront`で明示的に前面化しています(`Sources/Voicewriter/App/SettingsWindowController.swift`)。6つのタブで構成されます(`Sources/Voicewriter/Settings/`)。
 
 - **マイク**: マイクモード(常時オープン/必要時のみ)の切替、プリロール秒数(0〜2秒、常時オープン時のみ有効)、リングバッファ秒数、マイクをオフにするまでの秒数(2〜30秒、必要時のみモード時のみ有効)のスライダー。マイクモードとリングバッファ秒数の変更は`AudioCaptureEngine`へ即座に反映されます(常時オープンへの切替はAVAudioEngineを起動、必要時のみへの切替は録音中でなければ即座にエンジンを停止)。
 - **ショートカット**: `KeyboardShortcuts.Recorder`でPush-to-Talk/トグル/キャンセルの割当を変更できます。変更はライブラリ側が自動的に永続化・グローバル監視へ反映します。
 - **音声認識**: エンジン(whisper.cpp/スタブ)と言語(`ja`/`auto`)の選択、認識のヒント(`initial_prompt`用の語彙ヒント、カンマ区切り)、モデルファイルの状態表示(配置済みならパスとサイズ、未配置なら通常は初回起動時に自動でダウンロードが進行中のはずだが、失敗した場合のためのダウンロードボタンで進捗付きダウンロードを実行可能)。エンジン/言語の変更は次回の文字起こしから反映されます(`Sources/Voicewriter/Transcription/DynamicTranscriptionEngine.swift`が内部エンジンを差し替える)。ヒントの変更はエンジン再ロード不要で次回の文字起こしから反映されます。
 - **整形**: LLM整形(下記「LLM整形パス」参照)のON/OFF、Ollamaモデル選択(`/api/tags`から動的取得)、タイムアウト秒数、Ollama未導入の場合の案内文(公式URL付き)。
+- **辞書**: ユーザー定義の置換ルール(下記「ユーザー辞書(置換)」参照)の一覧編集。有効/無効の切替、置換元/置換先の編集、行の追加・削除・並べ替え(ドラッグ)、`dictionary.json`をFinderで表示するボタン。編集はキー入力のたびに即座に保存されます。
 - **一般**: ログイン時に起動するかどうかを`SMAppService.mainApp`(macOS 13+)で登録/解除します。加えて、状態表示HUD・効果音のON/OFF(下記「状態表示HUDと効果音」参照、いずれも既定ON)。
 
 ## 状態表示HUDと効果音
@@ -438,6 +481,49 @@ defaults write dev.voicewriter.app micMode -string onDemand
 
 ログイン時起動の設定は`UserDefaults`ではなく`SMAppService`がOS側で管理するため、上記の一覧には含まれません。
 
+## ユーザー辞書(置換)
+
+音声認識・LLM整形の結果テキストに対し、挿入直前に「置換元→置換先」のルールを上から順に適用する独立レイヤーです(`Sources/Voicewriter/Dictionary/`)。Amicalの同種機能を参考にしました。誤認識の確定修正(例:「ボイスライダー」→「Voicewriter」)や、専門用語・固有名詞の表記統一に使えます。
+
+### 適用順序
+
+```
+whisper.cpp(音声認識) → LLM整形(有効な場合のみ) → ユーザー辞書(置換) → カーソル位置へ挿入
+```
+
+LLM整形が無効、またはOllama未起動/タイムアウト等で失敗し原文へフォールバックした場合も、辞書はその原文に対して必ず適用されます(`Coordinator.runJob`の最終段、`Sources/Voicewriter/App/Coordinator.swift`)。
+
+### 保存先(`dictionary.json`)
+
+`~/Library/Application Support/Voicewriter/dictionary.json` に人間が読める整形JSONで保存します。`UserDefaults`ではなくファイルにしているのは、手編集・バックアップ・将来の共有を考慮したためです。読み書きはアトミック(一時ファイルへ書いてから`rename`/`replaceItemAt`)に行い、書き込み途中のクラッシュで壊れたファイルが残らないようにしています。破損したJSONを読み込んだ場合は空辞書として起動し、警告ログを出します(壊れたファイル自体は上書きせず、次に設定画面から編集・保存するまでそのまま残ります)。設定画面の「辞書」タブに「dictionary.jsonをFinderで表示」ボタンがあります。
+
+例:
+
+```json
+{
+  "rules" : [
+    {
+      "from" : "ボイスライダー",
+      "to" : "Voicewriter",
+      "isEnabled" : true,
+      "id" : "9B1F1A9E-6F2C-4E3D-9C3A-2E9B7C1D0A11"
+    }
+  ]
+}
+```
+
+### 置換ロジック(`UserDictionaryReplacer`)
+
+有効なルールを登録順に`String.replacingOccurrences`で単純置換します(最長一致・単語境界の考慮はしません)。大文字/小文字は区別します。各ルールは直前までの適用結果に対して適用されるため、「A→B」「B→C」の2ルールがこの順にあれば最終的に"A"は"C"になります(部分一致の連鎖)。置換元が空文字のルールは無視します。
+
+### 語彙ヒントへの連動(`DictionaryVocabularyHint`)
+
+有効な置換先(`to`)のうち、既存の語彙ヒント(`Settings.sttVocabularyHint`)にまだ含まれていないユニークな語を、登録順で先頭から最大20語まで自動的に追加します。whisper.cppの`initial_prompt`とLLM整形プロンプトの語彙注入は、いずれも録音開始時点の設定スナップショット(`DictationJobSettingsSnapshot.vocabularyHint`)という単一のフィールドを経由するため、この1箇所でのマージが両方に反映されます。
+
+### 待ち行列中の辞書編集は既に録音済みのジョブに影響しない
+
+他の設定値(言語・VAD・整形モデル等)と同様に、辞書も録音開始時点でスナップショット(`DictationJobSettingsSnapshot.dictionaryRules`)として確定します。処理中(認識・整形・挿入待ち)のジョブが残っている間に設定画面で辞書を編集しても、そのジョブは録音時点の辞書のまま処理されます。
+
 ## グローバルホットキー (デフォルト)
 
 [KeyboardShortcuts](https://github.com/sindresorhus/KeyboardShortcuts) を使用しています。設定ウィンドウの「ショートカット」タブから`KeyboardShortcuts.Recorder`で変更できるほか、`defaults write dev.voicewriter.app KeyboardShortcuts_pushToTalk ...`のようにUserDefaults直接編集も可能です。
@@ -544,12 +630,13 @@ Sources/Voicewriter/
     Settings.swift
     SettingsWindowController.swift  設定ウィンドウの生成・前面化(LSUIElement対応)
     LaunchAtLogin.swift             SMAppServiceによるログイン時起動の登録/解除
-  Settings/         設定ウィンドウのSwiftUIビュー(5タブ)
+  Settings/         設定ウィンドウのSwiftUIビュー(6タブ)
     SettingsView.swift
     MicSettingsView.swift
     ShortcutsSettingsView.swift
     TranscriptionSettingsView.swift
     FormattingSettingsView.swift      LLM整形のON/OFF・モデル選択・タイムアウト
+    DictionarySettingsView.swift      ユーザー辞書(置換ルール)の一覧編集(詳細は「ユーザー辞書(置換)」参照)
     GeneralSettingsView.swift         ログイン時起動・状態表示HUD/効果音のON/OFF
   AudioCapture/     AVAudioEngine周りの音声キャプチャ
     AudioCaptureEngine.swift
@@ -575,6 +662,11 @@ Sources/Voicewriter/
   TextInsertion/    カーソル位置へのテキスト挿入(Amical方式)
     TextInserter.swift        insert(text:onPasted:)。TextInsertingプロトコルでテスト容易化
     AccessibilityPermission.swift
+  Dictionary/       ユーザー辞書(置換)。詳細は「ユーザー辞書(置換)」参照
+    UserDictionaryRule.swift       ルール(from/to/isEnabled)・dictionary.jsonのトップレベル構造
+    UserDictionaryReplacer.swift   置換ロジック本体(純粋関数)
+    DictionaryVocabularyHint.swift 置換先語彙をwhisper/LLM整形の語彙ヒントへ自動追加する純粋関数
+    UserDictionaryStore.swift      dictionary.jsonの永続化(アトミック書き込み・破損時は空辞書で起動)
   HUD/              状態表示HUD(浮遊ピル、詳細は「状態表示HUDと効果音」参照)
     StatusHUDPanel.swift       フォーカスを奪わないNSPanelサブクラス
     StatusHUDController.swift  Coordinator等からの配線・集約スナップショットからの表示導出・表示/非表示のフェード制御
@@ -603,6 +695,10 @@ Tests/VoicewriterTests/
   DeliveryCoordinatorTests.swift         リオーダーバッファ(sequence順コミット・墓標による順序消費・録音中の保留・フォーカス不一致(TextInserter内最終確認含む)・挿入失敗・墓標のキャンセル優先度)の単体テスト
   TextInserterTests.swift                 insert(text:onPasted:)がコール単位で完了通知を受け取る回帰テスト
   CoordinatorPipelineTests.swift          連続音声入力パイプライン全体(即座の次録音開始・発話順の厳守・Esc階層・キュー上限(finalizing中拒否後のidle復帰含む)・停止グレー中の再押下(短いPTTの取り消し含む)・挿入クリティカル区間の無条件待機・墓標による順序消費)の結合テスト
+  UserDictionaryReplacerTests.swift      ユーザー辞書の置換ロジック(複数ルールの順序適用・部分一致の連鎖・無効ルールのスキップ・日本語)の単体テスト
+  DictionaryVocabularyHintTests.swift    置換先語彙の語彙ヒントへの自動追加(重複除去・上限20語・既存ヒントとの結合)の単体テスト
+  UserDictionaryStoreTests.swift         dictionary.jsonのアトミック書き込み・破損ファイルからの復旧(空辞書起動)の単体テスト(一時ディレクトリを使用、実ファイルには一切触れない)
+  CoordinatorDictionaryTests.swift       ユーザー辞書のCoordinator統合テスト(整形あり/なし双方での最終適用・待ち行列中の辞書変更が録音済みジョブに影響しないこと・語彙ヒントへの連動)
 Resources/
   Info.plist
 vendor/
@@ -643,6 +739,7 @@ scripts/
   - 新規作成した完全な無音WAV(`scripts/fixtures/sample-silence-16k.wav`)で、VAD無効(デコードパラメータのみ)だと実際に「ご視聴ありがとうございました」というハルシネーションが再現すること、VAD有効(`VERIFY_WHISPER_VAD=1`)にすると`Final speech segments after filtering: 0`となり出力が完全に空になることを確認済み(公式README記載のVAD挙動の実地確認)。
   - 既存の日本語フィクスチャ(`sample-ja-16k.wav`ほか計7件)を`no_speech_thold`差し戻し(0.2→0.6)・`speech_pad_ms`変更(30→100ms)後に再実行し、いずれも変更前と完全に同一の認識結果(回帰なし)であることを確認済み。
 - **連続音声入力パイプライン化後**(詳細は上記「連続音声入力パイプライン」参照)、`swift build`(警告ゼロ、Swift 6言語モードで将来エラーになりうる`nonisolated`コンテキストからのMainActor隔離静的プロパティ参照を`??`フォールバック方式で解消)/ `swift build -c release` / `scripts/build-app.sh release` / `swift test`(116件、新規`SerialFIFOQueueTests`2件・`DictationJobRegistryTests`7件・`DeliveryCoordinatorTests`6件・`TextInserterTests`4件・`CoordinatorPipelineTests`6件を追加、既存テストは新しい非同期API・コールバック形状に合わせて更新)がすべて成功することを確認済み。`swift run -c release verify-whisper scripts/fixtures/sample-ja-16k.wav`でも従来通りの認識結果(回帰なし)を確認済み。`.app`を起動し、`ps aux`でメニューバー常駐プロセスとして生存し続けること、`log show`でクラッシュ・診断レポート(`~/Library/Logs/DiagnosticReports/`)なく、起動時のOllamaプリロードリクエストが成功(HTTP 200)することを確認済み。実際のキー操作を伴う対話的な実機確認は未実施(上記「連続音声入力パイプラインの実機確認」参照)。
+- **ユーザー辞書(置換)追加後**(詳細は上記「ユーザー辞書(置換)」参照)、`swift build` / `swift build -c release` / `scripts/build-app.sh release` / `swift test`(172件、新規`UserDictionaryReplacerTests`11件・`DictionaryVocabularyHintTests`10件・`UserDictionaryStoreTests`7件・`CoordinatorDictionaryTests`6件を追加、既存テストへの変更なし)がすべて成功することを確認済み。`~/Library/Application Support/Voicewriter/dictionary.json`に「ボイスライター→Voicewriter」のルールを1件配置した状態で(既存の起動中プロセスは`kill`してから)`.app`を起動し、`ps aux`でメニューバー常駐プロセスとして生存し続けること、`log show --predicate 'subsystem == "dev.voicewriter.app"'`で`UserDictionaryStore`カテゴリの破損/読み込み失敗ログが一切出ておらず(=配置したdictionary.jsonが正しくパースされている)、診断レポート(`~/Library/Logs/DiagnosticReports/`)も無いことを確認済み。実際の置換適用自体は`verify-whisper`ではなく`CoordinatorDictionaryTests`(実際のパイプライン相当のCoordinator統合テスト、整形あり/なし双方での最終適用・待ち行列中の辞書変更が録音済みジョブに影響しないこと・語彙ヒントへの連動を検証)で確認している。
 
 ## 並行処理まわりの修正(Codexレビュー対応)
 

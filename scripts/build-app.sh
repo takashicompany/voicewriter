@@ -31,6 +31,21 @@ mkdir -p "$MACOS_DIR" "$RESOURCES_DIR" "$FRAMEWORKS_DIR"
 cp "$EXECUTABLE" "$MACOS_DIR/Voicewriter"
 cp "$ROOT_DIR/Resources/Info.plist" "$CONTENTS_DIR/Info.plist"
 
+# アプリアイコン(.icns)。Info.plistのCFBundleIconFile="AppIcon"に対応させるため
+# ファイル名はAppIcon.icnsのままContents/Resourcesへ配置する。
+if [[ -f "$ROOT_DIR/Resources/AppIcon.icns" ]]; then
+  cp "$ROOT_DIR/Resources/AppIcon.icns" "$RESOURCES_DIR/AppIcon.icns"
+else
+  echo "warning: $ROOT_DIR/Resources/AppIcon.icns not found (app will use the default generic icon)" >&2
+fi
+
+# メニューバー用ブランドグリフ(1x/2x PNG)。StatusBarControllerがBundle.main.resourcePath配下の
+# MenuBarIcon/を実行時に読むため、Contents/Resourcesにそのままコピーする。
+if [[ -d "$ROOT_DIR/Resources/MenuBarIcon" ]]; then
+  mkdir -p "$RESOURCES_DIR/MenuBarIcon"
+  cp "$ROOT_DIR/Resources/MenuBarIcon/"*.png "$RESOURCES_DIR/MenuBarIcon/"
+fi
+
 # KeyboardShortcutsのリソースバンドル(ローカライズ文字列等)が生成されていればコピーする
 if [[ -d "$BIN_PATH/KeyboardShortcuts_KeyboardShortcuts.bundle" ]]; then
   cp -R "$BIN_PATH/KeyboardShortcuts_KeyboardShortcuts.bundle" "$RESOURCES_DIR/"

@@ -34,6 +34,35 @@ final class StatusBarController {
     private let onOpenSettings: () -> Void
     private let onCancelAllJobs: () -> Void
 
+    /// メニューバー用の自前グリフ(採用アイコン案icon-33のピクトグラムから抽出したマイク+ペン先)。
+    /// `Resources/MenuBarIcon/menubar-icon.png`(@1x, 10x18px)と`menubar-icon@2x.png`(@2x, 20x36px)
+    /// から1つの`NSImage`に1x/2x両方の表現をまとめ、`isTemplate = true`でシステムに配色を任せる
+    /// (`contentTintColor`による着色は従来のSF Symbolsアイコンと同様に効く)。
+    /// グリフが縦長(高さ18pxに対し横幅10px程度)なため、表示上のポイントサイズは正方形に固定せず
+    /// `rep1x`の実ピクセル寸法(@1xは1px=1pt相当)をそのまま使う。これを正方形に固定してしまうと
+    /// 画像が横方向に間延びして再度余白過多に見えてしまう(過去の実機フィードバックで発生した不具合)。
+    /// `.app`バンドル化されていない`swift run`実行時などリソースが見つからない場合はnilとなり、
+    /// 呼び出し側(`applyIcon(for:)`)が既存のSF Symbolへフォールバックする。
+    private static let brandGlyphImage: NSImage? = {
+        guard let resourceDir = Bundle.main.resourcePath else { return nil }
+        guard
+            let data1x = FileManager.default.contents(atPath: "\(resourceDir)/MenuBarIcon/menubar-icon.png"),
+            let data2x = FileManager.default.contents(atPath: "\(resourceDir)/MenuBarIcon/menubar-icon@2x.png"),
+            let rep1x = NSBitmapImageRep(data: data1x),
+            let rep2x = NSBitmapImageRep(data: data2x)
+        else {
+            return nil
+        }
+        let pointSize = NSSize(width: CGFloat(rep1x.pixelsWide), height: CGFloat(rep1x.pixelsHigh))
+        rep1x.size = pointSize
+        rep2x.size = pointSize
+        let image = NSImage(size: pointSize)
+        image.addRepresentation(rep1x)
+        image.addRepresentation(rep2x)
+        image.isTemplate = true
+        return image
+    }()
+
     init(coordinator: Coordinator, onOpenSettings: @escaping () -> Void, onCancelAllJobs: @escaping () -> Void) {
         self.onOpenSettings = onOpenSettings
         self.onCancelAllJobs = onCancelAllJobs
@@ -176,16 +205,22 @@ final class StatusBarController {
         var symbolName: String
         let label: String
         var tintColor: NSColor?
+        // 通常時・録音中は自前のブランドグリフ(マイク+ペン先)を使う。文字起こし中(処理中を示す
+        // アニメーション的な三点)・警告(注意喚起の三角+感嘆符)は形そのものに意味があり、静的な
+        // グリフでは代替できないため、既存のSF Symbolsによる状態表現を維持する。
+        var useBrandGlyph = false
 
         switch state {
         case .idle:
             symbolName = "mic"
             label = "状態: 待機中"
             tintColor = nil
+            useBrandGlyph = true
         case .recording:
             symbolName = "mic.fill"
             label = "状態: 録音中"
             tintColor = .systemRed
+            useBrandGlyph = true
         case .transcribing:
             symbolName = "ellipsis.circle"
             label = "状態: 文字起こし中"
@@ -195,11 +230,15 @@ final class StatusBarController {
         if !warnings.isEmpty && state == .idle {
             symbolName = "mic.trianglebadge.exclamationmark"
             tintColor = .systemYellow
+            useBrandGlyph = false
         }
 
         if let button = statusItem.button {
-            let image = NSImage(systemSymbolName: symbolName, accessibilityDescription: "Voicewriter")
-            button.image = image
+            if useBrandGlyph, let brandImage = Self.brandGlyphImage {
+                button.image = brandImage
+            } else {
+                button.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: "Voicewriter")
+            }
             button.contentTintColor = tintColor
         }
         stateMenuItem.title = label
