@@ -35,6 +35,20 @@ struct FormattingSettingsView: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
+
+            Section("Ollamaが未導入の場合") {
+                Text("LLM整形にはOllama(ローカルで動くLLM実行環境)が必要です。未インストール、または起動していない間はこの機能を自動的に無効(未整形のまま挿入)として動作します。整形を使いたい場合は、以下からOllamaをインストールし、起動した上でモデル(既定は qwen3:14b、例: ターミナルで `ollama pull qwen3:14b`)を取得してください。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text("https://ollama.com/download")
+                    .font(.footnote)
+                    .textSelection(.enabled)
+                Text("Ollamaを後から起動した場合、次回の音声入力から自動的に整形が有効になります(再起動不要)。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .padding()
         .onAppear {

@@ -29,6 +29,15 @@ final class StatusHUDController {
     /// 完了通知が別ジョブの認識中/整形中表示を上書きしたまま自動的に隠れてしまっていた)。
     private var lastPhase: TranscriptionPhase?
 
+    /// whisperモデルの初回自動セットアップ(ダウンロード)が進行中かどうか。trueの間は
+    /// 通常の状態遷移由来の表示更新(録音/フェーズ/コミット/キュー満杯)を無視する
+    /// (実際には`Coordinator.isModelSetupBlocking`により、この間は録音自体が開始されない
+    /// ため通常は競合しないが、念のための防御)。
+    private var isSetupBlockingDisplay = false
+    /// セットアップ中に直近報告された進捗(0.0〜1.0)。「セットアップ中です」の一時通知の後、
+    /// 進捗表示へ復元するために保持する。
+    private var lastSetupProgress: Double = 0
+
     init() {
         let size = StatusHUDContentView.panelSize
         let panel = StatusHUDPanel(contentSize: size)
@@ -42,25 +51,30 @@ final class StatusHUDController {
 
     /// `Coordinator.onStateChanged`から呼ぶ。
     func handleStateChanged(_ state: AppState) {
+        // 内部スナップショット(isRecordingNow)は、セットアップ中の表示抑止(isSetupBlockingDisplay)
+        // とは無関係に常に最新へ保つ(実際にはセットアップ中に録音自体が開始されないため、実質的には
+        // 起こらない想定だが、セットアップ解除直後に古いスナップショットを引きずらないための防御)。
+        switch state {
+        case .recording: isRecordingNow = true
+        case .transcribing, .idle: isRecordingNow = false
+        }
+        guard !isSetupBlockingDisplay else { return }
         guard Settings.hudEnabled else {
             hideImmediately()
             return
         }
         switch state {
         case .recording:
-            isRecordingNow = true
             autoHideWorkItem?.cancel()
             viewModel.display = .recording(level: lastLevel, pendingCount: pendingCount)
             show()
         case .transcribing:
-            isRecordingNow = false
             // 録音終了直後、まだこのジョブ自身のフェーズ通知が届く前でも、既に他の未終端ジョブが
             // 処理中(またはコミット待ち)であれば、直近の処理フェーズ表示へ戻す
             // (Codexレビュー指摘#9: 以前は録音中のレベルメーター表示のまま固まって見えたり、
             // 何も表示されないまま次のフェーズ通知を待つだけだった)。
             restoreProcessingPhaseDisplayIfPending()
         case .idle:
-            isRecordingNow = false
             // 挿入結果(成功/フォールバック警告)は`reportJobCommitted`で別途通知される。
             // 録音キャンセルや致命的エラーなど、結果が来ないまま idle に戻るケースもあるため、
             // 一定時間だれからも通知が来なければ隠す(自動キャンセル的なフェイルセーフ)。
@@ -70,12 +84,15 @@ final class StatusHUDController {
 
     /// `Coordinator.onPendingJobCountChanged`から呼ぶ(HUDの「残り件数」表示用)。
     func handlePendingJobCountChanged(_ count: Int) {
+        // pendingCount/lastPhaseの内部スナップショットは、表示抑止中(isSetupBlockingDisplay)でも
+        // 更新し続ける(解除後にすぐ古い値を表示してしまわないため)。
         pendingCount = count
         if count == 0 {
             // 未終端ジョブが無くなった時点で、直近のフェーズ記憶も破棄する。次に新しい発話が
             // 始まった際に、古いフェーズがそのまま復元されてしまわないようにするため。
             lastPhase = nil
         }
+        guard !isSetupBlockingDisplay else { return }
         guard Settings.hudEnabled else { return }
         // 録音中表示は完了/件数変化で上書きしない(録音表示自体は`handleStateChanged`/`updateLevel`が
         // 都度`pendingCount`を織り込んで更新するため、ここでは反映するだけで良い)。
@@ -86,7 +103,9 @@ final class StatusHUDController {
 
     /// `Coordinator.onPhaseChanged`から呼ぶ。録音中は表示を上書きしない(優先順位: 録音中 > フェーズ)。
     func handlePhaseChanged(_ phase: TranscriptionPhase) {
+        // lastPhaseの内部スナップショットは表示抑止中でも更新し続ける(理由は上記メソッド群と同じ)。
         lastPhase = phase
+        guard !isSetupBlockingDisplay else { return }
         guard Settings.hudEnabled else { return }
         guard !isRecordingNow else { return }
         switch phase {
@@ -101,6 +120,7 @@ final class StatusHUDController {
 
     /// `AudioCaptureEngine.onLevelUpdate`から呼ぶ(録音中のみ意味を持つ)。
     func updateLevel(_ rms: Float) {
+        guard !isSetupBlockingDisplay else { return }
         guard Settings.hudEnabled else { return }
         guard isRecordingNow else { return }
         // RMSは概ね小さい値(発話でも0.05〜0.2程度)なので、バーが動く程度に見えるよう強調する。
@@ -112,6 +132,7 @@ final class StatusHUDController {
     /// `Coordinator.onJobCommitted`から呼ぶ(挿入完了/スキップ/キャンセル/失敗/フォーカス不一致)。
     /// 録音中は表示を上書きしない(不変条件: 録音中のレベルメーター表示を完了通知が奪わない)。
     func reportJobCommitted(_ result: DictationJobCommitEvent) {
+        guard !isSetupBlockingDisplay else { return }
         guard Settings.hudEnabled else { return }
         guard !isRecordingNow else { return }
 
@@ -147,12 +168,85 @@ final class StatusHUDController {
 
     /// `Coordinator.onQueueFull`から呼ぶ。通常のビープと区別できる表示。
     func reportQueueFull() {
+        guard !isSetupBlockingDisplay else { return }
         guard Settings.hudEnabled else { return }
         guard !isRecordingNow else { return }
         autoHideWorkItem?.cancel()
         viewModel.display = .queueFull
         show()
         scheduleAutoHide(after: 1.2)
+    }
+
+    // MARK: - 初回モデルセットアップ(自動ダウンロード)の表示
+
+    /// `AppDelegate`が`ModelDownloader.state`の変化から呼ぶ。ダウンロード中は自動的に隠れない
+    /// (セットアップが終わるまでユーザーに常時見える状態を保つ)。
+    func reportModelSetupDownloading(progress: Double) {
+        isSetupBlockingDisplay = true
+        lastSetupProgress = progress
+        guard Settings.hudEnabled else { return }
+        autoHideWorkItem?.cancel()
+        viewModel.display = .settingUp(message: Self.setupDownloadingMessage(progress: progress))
+        show()
+    }
+
+    private static func setupDownloadingMessage(progress: Double) -> String {
+        "初回セットアップ中: モデルをダウンロードしています… \(Int((progress * 100).rounded()))%"
+    }
+
+    /// モデルの自動ダウンロードが成功した際に呼ぶ。短時間の完了表示の後、通常の表示へ戻す。
+    func reportModelSetupSucceeded() {
+        isSetupBlockingDisplay = false
+        guard Settings.hudEnabled else { return }
+        autoHideWorkItem?.cancel()
+        viewModel.display = .success
+        show()
+        scheduleAutoHide(after: 1.2)
+    }
+
+    /// モデルの自動ダウンロードが失敗した際に呼ぶ(ディスク容量不足・ネットワーク失敗等)。
+    /// 詳細な案内・再試行導線はメニューバー/設定画面側が担うため、ここでは短時間の通知のみ行う。
+    func reportModelSetupFailed(message: String) {
+        isSetupBlockingDisplay = false
+        guard Settings.hudEnabled else { return }
+        autoHideWorkItem?.cancel()
+        viewModel.display = .setupFailed(message: message)
+        show()
+        scheduleAutoHide(after: 4.0)
+    }
+
+    /// セットアップが(ユーザーによるキャンセル等で)`.idle`へ戻った際に呼ぶ。
+    /// セットアップ関連の表示中だった場合のみ隠す(無関係な表示を誤って隠さないため)。
+    func reportModelSetupIdle() {
+        isSetupBlockingDisplay = false
+        switch viewModel.display {
+        case .settingUp, .setupFailed:
+            hide()
+        default:
+            break
+        }
+    }
+
+    /// セットアップ中にF13(PTT)/トグルで録音が要求され、拒否したことを通知する。
+    /// 通常の`scheduleAutoHide`(=`resolveAfterTemporaryDisplay`経由でHUDを完全に隠す)は使わず、
+    /// 一定時間後もまだセットアップ中であれば進捗表示へ復元する(セットアップ中は常時表示という
+    /// 不変条件を保つため)。
+    func reportRecordingRejectedDuringSetup() {
+        guard Settings.hudEnabled else { return }
+        autoHideWorkItem?.cancel()
+        viewModel.display = .setupInProgressRejected
+        show()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            if self.isSetupBlockingDisplay {
+                self.viewModel.display = .settingUp(message: Self.setupDownloadingMessage(progress: self.lastSetupProgress))
+                self.show()
+            } else {
+                self.resolveAfterTemporaryDisplay()
+            }
+        }
+        autoHideWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: workItem)
     }
 
     // MARK: - 表示/非表示(フェード)

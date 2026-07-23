@@ -3,7 +3,10 @@ import SwiftUI
 /// 音声認識タブ: エンジン選択・言語選択・モデルファイルの状態表示とダウンロード。
 struct TranscriptionSettingsView: View {
     @ObservedObject var transcriptionEngine: DynamicTranscriptionEngine
-    @StateObject private var downloader = ModelDownloader()
+    /// `AppDelegate`が所有する単一インスタンスを注入する(起動時の自動ダウンロードと
+    /// この画面の手動ダウンロードボタンが同一インスタンスを共有することで、二重起動を防ぐ。
+    /// `ModelDownloader.canStartDownload(from:)`が状態機械レベルでも二重起動を防ぐ)。
+    @ObservedObject var downloader: ModelDownloader
 
     @AppStorage(SettingsKey.sttEngine) private var sttEngine: SttEngineKind = .whisperCpp
     @AppStorage(SettingsKey.sttLanguage) private var sttLanguage: String = "ja"
@@ -86,10 +89,10 @@ struct TranscriptionSettingsView: View {
         }
         .onChange(of: downloader.state) { _, newState in
             if case .success = newState {
+                // エンジンのreload()自体は`AppDelegate`(`modelDownloader.$state`の一元的な購読元)が
+                // 行う。ここでも呼ぶと二重ロードになる(自動トリガー・手動トリガーいずれの場合も
+                // AppDelegate側が単一の経路として反映するため、ここではUI表示の更新のみ行う)。
                 modelIsAvailable = WhisperCppEngine.isModelAvailable()
-                if sttEngine == .whisperCpp {
-                    transcriptionEngine.reload()
-                }
             }
         }
     }
@@ -111,7 +114,7 @@ struct TranscriptionSettingsView: View {
             }
         } else {
             VStack(alignment: .leading, spacing: 8) {
-                Text("モデルが未配置です。下のボタンでダウンロードするか、ターミナルで `scripts/download-model.sh` を実行して手動配置してください。")
+                Text("モデルが未配置です。通常は初回起動時に自動的にダウンロードが始まります。進捗が表示されない、または失敗した場合は下のボタンで再試行するか、ターミナルで `scripts/download-model.sh` を実行して手動配置してください。")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

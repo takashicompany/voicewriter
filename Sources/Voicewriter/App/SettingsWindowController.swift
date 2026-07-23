@@ -9,11 +9,13 @@ final class SettingsWindowController: NSWindowController {
     init(
         audioEngine: AudioCaptureEngine,
         transcriptionEngine: DynamicTranscriptionEngine,
+        modelDownloader: ModelDownloader,
         onCancelShortcutChanged: @escaping () -> Void = {}
     ) {
         let rootView = SettingsView(
             audioEngine: audioEngine,
             transcriptionEngine: transcriptionEngine,
+            modelDownloader: modelDownloader,
             onCancelShortcutChanged: onCancelShortcutChanged
         )
         let hosting = NSHostingController(rootView: rootView)

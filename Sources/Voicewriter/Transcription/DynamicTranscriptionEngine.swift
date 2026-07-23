@@ -45,22 +45,39 @@ final class DynamicTranscriptionEngine: TranscriptionEngine, ObservableObject, @
     /// 差し替え後は旧エンジンへの参照をこのタスク内に残さないため、
     /// (進行中の文字起こしが保持しているものを除き)旧エンジンは差し替え直後に解放される。
     func reload() {
-        let requestedGeneration = reloadGeneration.next()
-        Task.detached(priority: .userInitiated) { [weak self, log] in
-            guard let self else { return }
-            let (newEngine, newWarning) = Self.makeEngine(log: log)
+        Task.detached(priority: .userInitiated) { [weak self] in
+            _ = await self?.reloadAndWait()
+        }
+    }
 
-            await MainActor.run {
-                guard self.reloadGeneration.isCurrent(requestedGeneration) else {
-                    // 自分より新しいreload()が既に呼ばれている。古い(追い越された)結果は破棄する。
-                    log.debug("Discarding stale reload() result (generation \(requestedGeneration) superseded)")
-                    return
-                }
-                self.replaceEngineSynchronized(with: newEngine)
-                self.activeEngineIsFallback = (newWarning != nil)
-                self.warning = newWarning
-                self.onWarningChanged?(newWarning)
+    /// `reload()`のawait可能版。呼び出し元が実際にエンジンの差し替え(モデルロード)完了まで
+    /// 待てるようにする(例: whisperモデルの初回自動セットアップ完了時、`AppDelegate`が
+    /// 「実際にwhisper.cppエンジンへ差し替わった」ことを確認してから録音のブロックを解除する
+    /// ために使う。ここで完了を待たずにブロックを解除してしまうと、ロード完了前に録音されると
+    /// 依然スタブが使われてしまい、ダミーテキストが挿入されてしまう)。
+    ///
+    /// 戻り値は反映後の`activeEngineIsFallback`。自分より新しい`reload()`/`reloadAndWait()`に
+    /// 追い越された場合は何も反映せず、その時点の`activeEngineIsFallback`をそのまま返す
+    /// (`reload()`の元の単調性ガードと同じ考え方)。
+    @discardableResult
+    func reloadAndWait() async -> Bool {
+        let requestedGeneration = reloadGeneration.next()
+        let capturedLog = log
+        let (newEngine, newWarning) = await Task.detached(priority: .userInitiated) {
+            Self.makeEngine(log: capturedLog)
+        }.value
+
+        return await MainActor.run {
+            guard self.reloadGeneration.isCurrent(requestedGeneration) else {
+                // 自分より新しいreload()が既に呼ばれている。古い(追い越された)結果は破棄する。
+                capturedLog.debug("Discarding stale reload() result (generation \(requestedGeneration) superseded)")
+                return self.activeEngineIsFallback
             }
+            self.replaceEngineSynchronized(with: newEngine)
+            self.activeEngineIsFallback = (newWarning != nil)
+            self.warning = newWarning
+            self.onWarningChanged?(newWarning)
+            return self.activeEngineIsFallback
         }
     }
 

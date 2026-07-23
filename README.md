@@ -105,14 +105,16 @@ VOICEWRITER_SIGN_IDENTITY="Developer ID Application: ..." VOICEWRITER_HARDENED=1
 
 1. バージョン番号の決定(引数 > `Resources/Info.plist`の`CFBundleShortVersionString` > 未設定なら`1.0.0`を書き込んで使用)。決定したバージョンが`Resources/Info.plist`の値と異なる場合は、ビルド前にそこへ書き戻す(zipファイル名とアプリ内`CFBundleShortVersionString`を一致させるため。`PlistBuddy`での書き戻し時、plist全体がキー順・インデントで再整形される点に注意)
 2. `scripts/build-app.sh release`でreleaseビルドの`.app`を作成
-3. `ditto -c -k --keepParent build/Voicewriter.app dist/Voicewriter-vX.Y.Z.zip`でZIP化(`ditto`は拡張属性・コード署名を保持したままZIP化できるため、macOSアプリの配布には`zip`コマンドより適している)
-4. 生成したZIPのSHA-256を出力(受け取り側が改ざん確認・受け渡し時の照合に使える)
+3. `ditto -c -k --norsrc --keepParent build/Voicewriter.app dist/Voicewriter-vX.Y.Z.zip`でZIP化(`ditto`はコード署名を保持したままZIP化できるため、macOSアプリの配布には`zip`コマンドより適している。`--norsrc`でリソースフォーク・拡張属性・ACL・隔離属性の保持自体をやめることで、ZIP内への`._*`(AppleDouble)ファイルの混入を防いでいる。コード署名自体はMach-Oバイナリ/`_CodeSignature`ディレクトリに実体があるためこれらに依存せず、`--norsrc`でも壊れない)
+4. 生成したZIPに`._*`(AppleDouble)ファイルが混入していないことを検証(1つでもあればスクリプトを失敗させる)
+5. 生成したZIPを`ditto`・`unzip`の両方で展開し、それぞれ`codesign --verify --deep --strict`が通ることを検証(`--norsrc`化で署名が壊れていないことの確認)
+6. 生成したZIPのSHA-256を出力(受け取り側が改ざん確認・受け渡し時の照合に使える)
 
 `dist/`は`.gitignore`対象です。バージョン引数を使ってリリースした場合、`Resources/Info.plist`の変更をコミットする前に`git diff`で意図した差分のみになっているか確認してください。
 
 ### 受け取り側への案内
 
-生成した`Voicewriter-vX.Y.Z.zip`と併せて、[INSTALL.md](INSTALL.md)を配布してください。`/Applications`への配置、初回起動時のGatekeeper操作(システム設定 > プライバシーとセキュリティ > 「このまま開く」)、「壊れているため開けません」と表示された場合の隔離属性除去(`xattr -dr com.apple.quarantine`)、マイク・アクセシビリティ権限の許可手順、初回起動時のwhisperモデル(約1.6GB)のダウンロード手順、LLM整形を使う場合の任意のOllamaセットアップ手順をまとめています。
+生成した`Voicewriter-vX.Y.Z.zip`と併せて、[INSTALL.md](INSTALL.md)を配布してください。`/Applications`への配置、初回起動時のGatekeeper操作(システム設定 > プライバシーとセキュリティ > 「このまま開く」)、「壊れているため開けません」と表示された場合の隔離属性除去(`xattr -dr com.apple.quarantine`)、マイク・アクセシビリティ権限の許可手順、初回起動時のwhisperモデル(約1.6GB)の自動セットアップの流れ、LLM整形を使う場合の任意のOllamaセットアップ手順をまとめています。whisperモデルは受け取り側の操作なしに初回起動時に自動でダウンロードされるため(下記「起動時のロードとフォールバック」参照)、以前のような「設定画面からダウンロードボタンを押す」手順の案内は不要になりました。
 
 ### 将来の公証(notarization)への移行手順の要約
 
@@ -121,7 +123,7 @@ Apple Developer Program(年額)に加入した場合、以下の流れで公証�
 1. Apple Developer Programに登録し、Developer ID Application証明書を取得してキーチェーンに導入する。
 2. `VOICEWRITER_SIGN_IDENTITY="Developer ID Application: ..."`と`VOICEWRITER_HARDENED=1`を指定して`scripts/build-app.sh release`を実行する(Hardened Runtime化・entitlements付与は本対応で既に切替可能な構造にしてある)。**ただし公証には署名にタイムスタンプ(`--timestamp`)が必須**であり、現状の`scripts/build-app.sh`の`codesign`呼び出しにはこのオプションが無いため、公証に対応する際は`codesign`呼び出しへ`--timestamp`を追加する変更が別途必要(自己署名証明書はタイムスタンプ局と通信できないため、既定では付けていない)。
 3. `.app`を`ditto`でZIP化し、`xcrun notarytool submit ... --wait`でAppleの公証サービスに提出する(Apple IDのApp用パスワードまたはApp Store Connect API Keyが必要)。
-4. 公証が通ったら`xcrun stapler staple build/Voicewriter.app`でチケットをアプリに添付してから配布ZIPを作成する(`scripts/package-release.sh`は内部で`build-app.sh`を再実行するため、staple後にそのまま使うとstaple前の`.app`で再ビルド・上書きしてしまう。stapleを含める場合は`package-release.sh`のビルド呼び出しをスキップし、`ditto -c -k --keepParent`のZIP化のみ別途実行すること)。
+4. 公証が通ったら`xcrun stapler staple build/Voicewriter.app`でチケットをアプリに添付してから配布ZIPを作成する(`scripts/package-release.sh`は内部で`build-app.sh`を再実行するため、staple後にそのまま使うとstaple前の`.app`で再ビルド・上書きしてしまう。stapleを含める場合は`package-release.sh`のビルド呼び出しをスキップし、`ditto -c -k --norsrc --keepParent`のZIP化のみ別途実行すること)。
 5. これにより受け取り側のGatekeeper警告・手動回避操作(INSTALL.mdの「初回起動」節)は不要になる。
 
 ## whisper.cpp統合
@@ -167,6 +169,17 @@ VAD(Voice Activity Detection)は既定ONです(詳細・経緯は下記「無音
 - モデルファイルが配置されていない、またはロードに失敗した場合は自動的に `StubTranscriptionEngine` にフォールバックし、メニューバーに警告(⚠️アイコン+メニュー項目)を表示するとともにログにも警告を出力します。
 - エンジン切り替えは `defaults write dev.voicewriter.app sttEngine -string stub`(または`whisperCpp`)で明示的に指定できます。
 - 言語は既定で `ja` です。`defaults write dev.voicewriter.app sttLanguage -string auto` で自動判定に切り替えられます。
+
+### 初回起動時の自動セットアップ(「.appを開けばそのまま使える」体験、`AppDelegate`/`ModelDownloader`)
+
+以前は、モデル未配置時に上記フォールバック(スタブ+メニューバー警告)が起きるだけで、ユーザーが自分で設定画面を開いて「ダウンロード」ボタンを押す必要がありました。受け取り側にこの操作を要求しないよう、以下の自動化を行いました。
+
+- `AppDelegate.applicationDidFinishLaunching`は、`Settings.sttEngine == .whisperCpp && !WhisperCppEngine.isModelAvailable()`(=whisperCppエンジン選択かつモデル未配置)の場合、ユーザー操作なしで`ModelDownloader.startDownload()`を呼びます。エンジンを明示的にスタブへ切り替えている場合は、その選択を尊重し自動ダウンロードは行いません。
+- `ModelDownloader`(進捗付き・世代管理・アトミック配置は既存実装のまま変更なし)は、`AppDelegate`が所有する単一インスタンスとして、設定画面「音声認識」タブの手動ダウンロードボタンとも共有します。`SettingsWindowController` → `SettingsView` → `TranscriptionSettingsView`と1つのインスタンスを注入することで、自動トリガーと手動トリガー(および失敗後の「再試行」)が同じ状態機械を操作するようになり、`ModelDownloader.canStartDownload(from:)`(既存の状態機械レベルのガード)により二重起動が起きません。
+- ダウンロード中は、画面下部のHUDに「初回セットアップ中: モデルをダウンロードしています… NN%」を進捗込みで常時表示し続けます(録音等の他の表示に上書きされたり自動的に隠れたりしません)。この間にF13(PTT)/トグルショートカットで録音が要求された場合は、`Coordinator.isModelSetupBlocking`により録音自体を開始せず拒否し、HUDに「セットアップ中です」を表示します(スタブへのフォールバックによるダミーテキスト挿入を防ぐため)。
+- ダウンロード成功時は、HUDに短い完了表示を出した後、`DynamicTranscriptionEngine.reload()`を呼んで新しく配置されたモデルを読み込み、以後は通常どおりwhisper.cppで動作します。
+- ディスク容量不足・ネットワーク失敗等でダウンロードが失敗した場合は、録音のブロックを解除し(=モデル未配置のまま、既存のスタブ+メニューバー警告のフォールバック動作に戻る)、HUDに理由を一定時間表示するとともに、メニューバーに「設定 > 音声認識 から再試行してください」という常設の警告を表示します。
+- VADモデルの自動ダウンロード(`VadModelAutoProvisioner`、下記「第3層」参照)は元々完全にサイレントなベストエフォート実装だったため、変更していません。
 
 ### whisper_fullのデコードパラメータ(実使用時の認識精度改善)
 
@@ -267,8 +280,8 @@ tccutil reset Microphone dev.voicewriter.app
 
 - **マイク**: マイクモード(常時オープン/必要時のみ)の切替、プリロール秒数(0〜2秒、常時オープン時のみ有効)、リングバッファ秒数、マイクをオフにするまでの秒数(2〜30秒、必要時のみモード時のみ有効)のスライダー。マイクモードとリングバッファ秒数の変更は`AudioCaptureEngine`へ即座に反映されます(常時オープンへの切替はAVAudioEngineを起動、必要時のみへの切替は録音中でなければ即座にエンジンを停止)。
 - **ショートカット**: `KeyboardShortcuts.Recorder`でPush-to-Talk/トグル/キャンセルの割当を変更できます。変更はライブラリ側が自動的に永続化・グローバル監視へ反映します。
-- **音声認識**: エンジン(whisper.cpp/スタブ)と言語(`ja`/`auto`)の選択、認識のヒント(`initial_prompt`用の語彙ヒント、カンマ区切り)、モデルファイルの状態表示(配置済みならパスとサイズ、未配置ならダウンロードボタンで進捗付きダウンロードを実行可能)。エンジン/言語の変更は次回の文字起こしから反映されます(`Sources/Voicewriter/Transcription/DynamicTranscriptionEngine.swift`が内部エンジンを差し替える)。ヒントの変更はエンジン再ロード不要で次回の文字起こしから反映されます。
-- **整形**: LLM整形(下記「LLM整形パス」参照)のON/OFF、Ollamaモデル選択(`/api/tags`から動的取得)、タイムアウト秒数。
+- **音声認識**: エンジン(whisper.cpp/スタブ)と言語(`ja`/`auto`)の選択、認識のヒント(`initial_prompt`用の語彙ヒント、カンマ区切り)、モデルファイルの状態表示(配置済みならパスとサイズ、未配置なら通常は初回起動時に自動でダウンロードが進行中のはずだが、失敗した場合のためのダウンロードボタンで進捗付きダウンロードを実行可能)。エンジン/言語の変更は次回の文字起こしから反映されます(`Sources/Voicewriter/Transcription/DynamicTranscriptionEngine.swift`が内部エンジンを差し替える)。ヒントの変更はエンジン再ロード不要で次回の文字起こしから反映されます。
+- **整形**: LLM整形(下記「LLM整形パス」参照)のON/OFF、Ollamaモデル選択(`/api/tags`から動的取得)、タイムアウト秒数、Ollama未導入の場合の案内文(公式URL付き)。
 - **一般**: ログイン時に起動するかどうかを`SMAppService.mainApp`(macOS 13+)で登録/解除します。加えて、状態表示HUD・効果音のON/OFF(下記「状態表示HUDと効果音」参照、いずれも既定ON)。
 
 ## 状態表示HUDと効果音
@@ -288,6 +301,9 @@ superwhisper/Wispr Flow風の、画面下部中央に浮かぶ小さなピル型
 | フォールバック挿入 | 警告アイコン + 「整形なしで挿入」を1.5秒表示してフェードアウト(LLM整形が失敗し原文へフォールバックした場合) |
 | スキップ/キャンセル/失敗/フォーカス不一致 | 「短すぎるためキャンセル」「無音のためキャンセル」「キャンセルしました」「文字起こしに失敗しました」「挿入先変更のため中止」等を1.0〜1.5秒表示してフェードアウト |
 | キュー上限到達 | オレンジのトレイアイコン + 「処理が追いついていません」(通常のビープと区別できる表示) |
+| モデル初回セットアップ中 | スピナー + 「初回セットアップ中: モデルをダウンロードしています… NN%」を進捗込みで常時表示(完了/失敗/キャンセルまで自動的に隠れない) |
+| モデルセットアップ失敗 | オレンジの警告アイコン + 失敗理由を4秒表示してフェードアウト(詳細な案内はメニューバー側が引き続き常設表示) |
+| セットアップ中の録音拒否 | 砂時計アイコン + 「セットアップ中です」を1秒表示後、まだセットアップ中であれば進捗表示へ復元 |
 | idle | 完全に非表示(パネルを`orderOut`) |
 
 表示/非表示は0.15秒のフェードアニメーション。ダーク寄りの半透明マテリアル(`.ultraThinMaterial`)・角丸ピル型・幅約224pxのコンパクトなパネル。
@@ -328,7 +344,14 @@ whisper.cpp生出力 → (ジョブの設定スナップショットでformattin
 
 `Coordinator`(`Sources/Voicewriter/App/Coordinator.swift`)の`runJob(_:)`がジョブ単位で認識・整形を呼び出します(`SerialFIFOQueue`で他ジョブと直列化、詳細は「連続音声入力パイプライン」参照)。整形中も表示状態は`.transcribing`のままなのでメニューバーは「処理中」表示を継続し、Esc(キャンセル)は整形の`await`中に押されても`DictationJobRegistry.isCancelled`チェックが整形完了後に行われるため正しく反映されます(`Tests/VoicewriterTests/CoordinatorFormattingTests.swift`で回帰テスト済み)。
 
-**整形が失敗した場合(Ollama未起動・タイムアウト・応答不正等)は、`OllamaFormatter`はエラーをthrowするのみで、`Coordinator`が必ずwhisper.cppの生出力へフォールバックします**。フォールバック時はメニューバーに5秒間だけ軽い警告(⚠️)を表示し、録音・挿入自体は中断しません。
+**整形が失敗した場合(Ollama未起動・タイムアウト・応答不正等)は、`OllamaFormatter`はエラーをthrowするのみで、`Coordinator`が必ずwhisper.cppの生出力へフォールバックします**。録音・挿入自体は中断しません。
+
+失敗理由によって通知の出し方を分けています(Ollama未検出は例外的な障害ではなく通常運用でありうる状態のため、発話のたびにナグ通知を出さないため)。
+
+- **Ollama未検出(`TextFormatterError.serverUnavailable`、接続不可=未起動/未導入)**: `Coordinator.onFormattingUnavailable`を呼び、メニューバーに「LLM整形: 無効(Ollama未検出)」という**常設(自動的には消えない)の状態表示**のみを出します(⚠️警告のような騒がしい見た目にはしません)。加えて、起動時に一度だけ`OllamaReachability.check()`(`GET`で短いタイムアウトの疎通確認、継続的なポーリングはしない)を行い、最初の発話を待たずにこの状態表示を出します。整形が成功すれば(=後からOllamaが起動された場合、次の音声入力の整形成功時に)`Coordinator.onFormattingRecovered`が呼ばれ、状態表示を自動的に消します。`Settings.formattingEnabled`自体は変更しません。
+- **それ以外(タイムアウト・応答不正等)**: 従来通り`Coordinator.onFormattingFailed`を呼び、メニューバーに5秒間だけ軽い警告(⚠️)を表示します。
+
+設定画面の「整形」タブには、Ollama未導入の場合の案内文(導入手順+公式URL `https://ollama.com/download`)を常時表示しています。
 
 ### API仕様(Ollama `/api/chat`)
 
@@ -540,13 +563,15 @@ Sources/Voicewriter/
     AudioPreprocessing.swift          先頭無音/低エネルギーノイズのトリム(純粋関数)
     StubTranscriptionEngine.swift
     DynamicTranscriptionEngine.swift  設定変更(エンジン/言語)を次回文字起こしから反映するラッパー
-    ModelDownloader.swift             設定画面からのモデルダウンロード(進捗付き)
+    ModelDownloader.swift             モデルダウンロード(進捗付き)。起動時の自動セットアップと設定画面の手動ボタンで単一インスタンスを共有(AppDelegateが所有)
+    VadModelAutoProvisioner.swift     VADモデルの起動時自動ダウンロード(完全にサイレントなベストエフォート)
     WavWriter.swift
   Formatting/       音声認識結果に対するLLM整形(Ollama)
     TextFormatter.swift        整形の抽象プロトコル・エラー型
     FormattingPrompt.swift     プロンプト組み立て・レスポンス解析(純粋関数、テスト容易)
     OllamaFormatter.swift      Ollama /api/chat 実装(構造化出力・think無効化・keep_alive・タイムアウト)
     OllamaModelLister.swift    設定画面用、/api/tagsからのモデル一覧取得
+    OllamaReachability.swift   起動時に1回だけ行う軽量な疎通確認(継続的なポーリングはしない、詳細は「LLM整形パス」参照)
   TextInsertion/    カーソル位置へのテキスト挿入(Amical方式)
     TextInserter.swift        insert(text:onPasted:)。TextInsertingプロトコルでテスト容易化
     AccessibilityPermission.swift
@@ -565,10 +590,11 @@ Tests/VoicewriterTests/
   AudioRingBufferTests.swift            リングバッファのロック境界・並行アクセスの回帰テスト
   AudioCaptureEngineFormatTests.swift   入力フォーマット検証ロジック・HUDレベルメーター用RMS計算の回帰テスト
   ModelDownloaderStateTests.swift       ダウンロード状態遷移(再試行可否)の回帰テスト
+  CoordinatorModelSetupBlockingTests.swift  モデル初回自動セットアップ中(isModelSetupBlocking)は録音開始要求(PTT/トグル)を拒否し、スタブへのダミーテキスト挿入を防ぐことの回帰テスト
   AudioPreprocessingTests.swift         先頭無音/低エネルギーノイズのトリムの回帰テスト
   CoordinatorCancelDuringTranscribingTests.swift  文字起こし中のEscキャンセルの回帰テスト
   FormattingPromptTests.swift            プロンプト組み立て・レスポンス解析(構造化JSON/タグ両対応)・長さ比チェックの単体テスト
-  CoordinatorFormattingTests.swift       整形成功/失敗時のフォールバック・整形中のEscキャンセル(実際のTaskキャンセルによる中断を含む)・設定スナップショット伝播(整形タイムアウト含む)・HUD用onPhaseChanged通知の回帰テスト
+  CoordinatorFormattingTests.swift       整形成功/失敗時のフォールバック・整形中のEscキャンセル(実際のTaskキャンセルによる中断を含む)・設定スナップショット伝播(整形タイムアウト含む)・HUD用onPhaseChanged通知・Ollama未検出時はonFormattingUnavailable(onFormattingFailedではない)を呼ぶこと・整形成功時にonFormattingRecoveredを呼ぶことの回帰テスト
   CoordinatorRecordingSkipTests.swift    ハルシネーション対策(第1層・第2層・第5層)のCoordinator側の統合テスト・VAD有効/無効の設定スナップショット伝播の回帰テスト
   OllamaFormatterIntegrationTests.swift  実際のOllamaへHTTPリクエストを送る統合テスト(Ollama未起動ならXCTSkip)
   HUDSettingsTests.swift                 hudEnabled/soundEffectsEnabled設定のデフォルト値・永続化の回帰テスト

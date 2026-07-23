@@ -4,6 +4,10 @@ import SwiftUI
 struct SettingsView: View {
     let audioEngine: AudioCaptureEngine
     @ObservedObject var transcriptionEngine: DynamicTranscriptionEngine
+    /// `AppDelegate`が所有する単一インスタンス。起動時の自動ダウンロードとこの画面の手動
+    /// ダウンロードボタンが同一インスタンスを共有する(二重起動防止、詳細は
+    /// `TranscriptionSettingsView`のコメント参照)。
+    @ObservedObject var modelDownloader: ModelDownloader
     /// キャンセルショートカットが設定画面で再割当てされた直後に呼ばれる(`ShortcutsSettingsView`参照)。
     var onCancelShortcutChanged: () -> Void = {}
 
@@ -15,7 +19,7 @@ struct SettingsView: View {
             ShortcutsSettingsView(onCancelShortcutChanged: onCancelShortcutChanged)
                 .tabItem { Label("ショートカット", systemImage: "keyboard") }
 
-            TranscriptionSettingsView(transcriptionEngine: transcriptionEngine)
+            TranscriptionSettingsView(transcriptionEngine: transcriptionEngine, downloader: modelDownloader)
                 .tabItem { Label("音声認識", systemImage: "waveform") }
 
             FormattingSettingsView()

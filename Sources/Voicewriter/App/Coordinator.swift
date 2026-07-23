@@ -104,6 +104,26 @@ final class Coordinator: AudioCaptureEngineDelegate {
     /// 表示専用の通知であり、状態機械のロジックには影響しない。常にFIFOの先頭(=現在実際に
     /// 推論を実行しているジョブ)についての通知になる。
     var onPhaseChanged: ((TranscriptionPhase) -> Void)?
+    /// LLM整形がOllama未起動(サーバー到達不可)により失敗した際に呼ばれる。`onFormattingFailed`とは
+    /// 区別し、こちらは発話のたびに5秒間フェードする警告バナーを出さない(Ollama未導入は例外的状況
+    /// ではなく通常運用でありうる状態のため、毎回のナグ通知を避ける)。メニューバーの
+    /// 「LLM整形: 無効(Ollama未検出)」という常設の状態表示の切り替えに使う想定。
+    var onFormattingUnavailable: (() -> Void)?
+    /// LLM整形が成功した際に呼ばれる(整形自体が有効かつ実行された場合、成功のたびに毎回呼ばれる)。
+    /// `onFormattingUnavailable`で立てた「Ollama未検出」の状態表示を元に戻す(後からOllamaが
+    /// 起動された場合に、次の整形成功時点で自動的に状態表示を消すため)のに使う想定。
+    /// 呼び出し側は冪等に扱ってよい(既に「利用可能」表示であれば無視してよい)。
+    var onFormattingRecovered: (() -> Void)?
+
+    /// whisperモデルの初回自動セットアップ(ダウンロード)が進行中かどうか。既定`false`
+    /// (このプロパティを使わない呼び出し元・テストの挙動には一切影響しない)。`AppDelegate`が
+    /// `ModelDownloader.state`の変化に応じて更新する。trueの間は新規録音の開始要求を
+    /// (PTT/トグルいずれも)受け付けず拒否する。誤ってスタブへ流れダミーテキストが挿入される
+    /// ことを防ぐため、フォールバックはさせず拒否のみとする(録音自体は開始しない)。
+    var isModelSetupBlocking = false
+    /// セットアップ中(`isModelSetupBlocking == true`)に録音開始が要求され、拒否した際に呼ばれる
+    /// (HUDの「セットアップ中です」表示用)。
+    var onRecordingRejectedDuringSetup: (() -> Void)?
 
     private let audioEngine: AudioCaptureEngineControlling
     private let transcriptionEngine: TranscriptionEngine
@@ -347,6 +367,18 @@ final class Coordinator: AudioCaptureEngineDelegate {
     /// —Codexレビュー指摘#1)。
     @discardableResult
     private func attemptStartRecording(source: ActivationSource) -> Bool {
+        // モデル自動セットアップ(ダウンロード)中は新規録音を開始しない(誤ってスタブへ流れ
+        // ダミーテキストが挿入されるのを防ぐため)。この関数は`beginPushToTalk()`/
+        // `toggleRecording()`の`.idle`分岐と、`finalizeRecordingTransition()`による
+        // `pendingStartRequest`の再生(finalizing明け後の自動開始)の**両方**が通る唯一の
+        // 経路であるため、ここでチェックすることで「セットアップがawait中や.finalizing中に
+        // 開始した」場合の迂回も防げる(録音の**停止**操作はこの関数を経由しないため、
+        // セットアップ中であっても進行中の録音停止は妨げない)。
+        guard !isModelSetupBlocking else {
+            log.info("Model setup in progress; rejecting new recording")
+            onRecordingRejectedDuringSetup?()
+            return false
+        }
         guard jobRegistry.canAcceptNewJob(limit: maxUnterminatedJobs) else {
             log.warning("Queue is full (limit=\(self.maxUnterminatedJobs, privacy: .public)); rejecting new recording")
             onQueueFull?()
@@ -578,13 +610,24 @@ final class Coordinator: AudioCaptureEngineDelegate {
                 defer { jobRegistry.clearCancellationHandle(job.sequence) }
                 do {
                     finalText = try await formatTask.value
+                    // 整形が成功した=Ollamaへ到達できた。起動時にOllama未検出と判定していても
+                    // (`onFormattingUnavailable`)、後から起動されて次の整形が成功すればここで
+                    // 「利用可能」の状態へ戻す。未検出表示中でなければ呼び出し先で無視してよい。
+                    onFormattingRecovered?()
                 } catch {
                     if jobRegistry.isCancelled(job.sequence) {
                         complete(.tombstone(.cancelled))
                         return
                     }
                     log.warning("Text formatting failed; falling back to raw transcription (sequence \(job.sequence, privacy: .public)): \(String(describing: error), privacy: .public)")
-                    onFormattingFailed?("LLM整形に失敗したため、未整形のテキストを使用しました: \(error)")
+                    if let formatterError = error as? TextFormatterError, case .serverUnavailable = formatterError {
+                        // Ollama未導入/未起動は例外的な障害ではなく通常運用でありうる状態のため、
+                        // 発話のたびに5秒間フェードする警告バナー(`onFormattingFailed`)は出さず、
+                        // メニューバーの常設状態表示のみ更新する。
+                        onFormattingUnavailable?()
+                    } else {
+                        onFormattingFailed?("LLM整形に失敗したため、未整形のテキストを使用しました: \(error)")
+                    }
                     finalText = rawText
                     usedFormattingFallback = true
                 }

@@ -6,7 +6,7 @@ import os.log
 /// 進捗をSwiftUIへ公開するため`ObservableObject`に準拠する。
 @MainActor
 final class ModelDownloader: NSObject, ObservableObject {
-    enum State: Equatable {
+    enum State: Equatable, Sendable {
         case idle
         case downloading(progress: Double, receivedBytes: Int64, totalBytes: Int64)
         case success

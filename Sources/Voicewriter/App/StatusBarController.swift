@@ -22,6 +22,11 @@ final class StatusBarController {
     private let cancelAllMenuItem: NSMenuItem
     private let warningMenuItem: NSMenuItem
     private let warningSeparator: NSMenuItem
+    /// LLM整形が(起動時にOllamaへ到達できなかったため)無効の間だけ表示する、常設の状態表示。
+    /// `warningMenuItem`(⚠️付き・自動的にアイコンも警告色にする)とは異なり、こちらは
+    /// 「Ollama未導入は例外的な障害ではなく通常運用でありうる状態」という位置づけのため、
+    /// 警告のような騒がしい見た目にはしない(アイコン変更もしない)。
+    private let formattingStatusMenuItem: NSMenuItem
     private let menu: NSMenu
     private var currentState: AppState = .idle
     private var warnings: [String] = []
@@ -45,6 +50,11 @@ final class StatusBarController {
         stateMenuItem = NSMenuItem(title: "状態: 待機中", action: nil, keyEquivalent: "")
         stateMenuItem.isEnabled = false
         menu.addItem(stateMenuItem)
+
+        formattingStatusMenuItem = NSMenuItem(title: "LLM整形: 無効(Ollama未検出)", action: nil, keyEquivalent: "")
+        formattingStatusMenuItem.isEnabled = false
+        formattingStatusMenuItem.isHidden = true
+        menu.addItem(formattingStatusMenuItem)
 
         menu.addItem(NSMenuItem.separator())
 
@@ -92,6 +102,12 @@ final class StatusBarController {
     func removeWarning(_ message: String) {
         warnings.removeAll { $0 == message }
         refreshWarningMenuItem()
+    }
+
+    /// LLM整形が(Ollama未検出のため)無効かどうかの常設状態表示を切り替える。冪等
+    /// (既に同じ状態であれば何もしない)。
+    func setFormattingUnavailable(_ unavailable: Bool) {
+        formattingStatusMenuItem.isHidden = !unavailable
     }
 
     /// 文字起こし結果を履歴へ記録する。自動挿入の成否によらず呼ぶこと

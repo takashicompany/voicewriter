@@ -61,6 +61,16 @@ struct StatusHUDContentView: View {
         case .queueFull:
             Image(systemName: "tray.full.fill")
                 .foregroundStyle(Color.orange)
+        case .settingUp:
+            ProgressView()
+                .controlSize(.small)
+                .tint(.white)
+        case .setupFailed:
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(Color.orange)
+        case .setupInProgressRejected:
+            Image(systemName: "hourglass")
+                .foregroundStyle(Color.white.opacity(0.7))
         }
     }
 
@@ -82,6 +92,12 @@ struct StatusHUDContentView: View {
             return message
         case .queueFull:
             return "処理が追いついていません"
+        case .settingUp(let message):
+            return message
+        case .setupFailed(let message):
+            return message
+        case .setupInProgressRejected:
+            return "セットアップ中です"
         }
     }
 

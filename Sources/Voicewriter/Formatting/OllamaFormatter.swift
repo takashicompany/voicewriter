@@ -89,8 +89,12 @@ final class OllamaFormatter: TextFormatter, @unchecked Sendable {
             data = try await Self.withTimeout(seconds: timeoutSeconds) { [session, request] in
                 let (data, response) = try await session.data(for: request)
                 guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+                    // HTTPレスポンス自体は得られている(=Ollamaプロセスへは到達できている)ため、
+                    // これは「サーバー未検出/到達不可」ではない。`.invalidResponse`として扱う
+                    // (「Ollama未検出」の判定(`.serverUnavailable`)は、下の`catch`が捕捉する
+                    // 接続自体の失敗(未起動・接続拒否等)専用にするため)。
                     let status = (response as? HTTPURLResponse)?.statusCode
-                    throw TextFormatterError.serverUnavailable("unexpected HTTP status \(status.map(String.init) ?? "?")")
+                    throw TextFormatterError.invalidResponse("unexpected HTTP status \(status.map(String.init) ?? "?")")
                 }
                 return data
             }
@@ -98,6 +102,9 @@ final class OllamaFormatter: TextFormatter, @unchecked Sendable {
             log.warning("Formatting request failed: \(error.description, privacy: .public)")
             throw error
         } catch {
+            // ここに到達するのは`session.data(for:)`自体がthrowした場合(接続拒否・未起動・
+            // DNS失敗等の transport-level failure)のみ。「Ollama未検出」の判定に使う
+            // `.serverUnavailable`はこのケース専用とする。
             log.warning("Ollama request failed (server unreachable?): \(error.localizedDescription, privacy: .public)")
             throw TextFormatterError.serverUnavailable(error.localizedDescription)
         }

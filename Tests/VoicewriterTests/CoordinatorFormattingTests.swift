@@ -373,6 +373,61 @@ final class CoordinatorFormattingTests: XCTestCase {
         XCTAssertTrue(formattingFailedMessages.isEmpty, "キャンセル起因のエラーでは「整形失敗」警告を出すべきではない")
     }
 
+    /// Ollama未検出(サーバー到達不可)による整形失敗は、発話のたびに5秒間フェードする警告バナー
+    /// (`onFormattingFailed`)ではなく、メニューバーの常設状態表示用の`onFormattingUnavailable`を
+    /// 呼ぶべき(Ollama未導入は例外的な障害ではなく通常運用でありうる状態のため、ナグを避ける)。
+    func testServerUnavailableCallsOnFormattingUnavailableNotOnFormattingFailed() async {
+        Settings.formattingEnabled = true
+        let audioEngine = FakeAudioCaptureEngine()
+        let transcriptionEngine = ImmediateTranscriptionEngine(text: "生の文字起こし結果")
+        let formatter = FixedTextFormatter(outcome: .failure(TextFormatterError.serverUnavailable("connection refused")))
+        let clock = FakeClock()
+        let textInserter = FakeTextInserter()
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter, textInserter: textInserter, now: clock.now)
+
+        var formattingFailedCount = 0
+        coordinator.onFormattingFailed = { _ in formattingFailedCount += 1 }
+        var formattingUnavailableCount = 0
+        coordinator.onFormattingUnavailable = { formattingUnavailableCount += 1 }
+
+        await coordinator.beginPushToTalk()
+        coordinator.endPushToTalk()
+        coordinator.audioCaptureEngine(audioEngine, didFinishRecording: nonSilentDummySamples, sampleRate: 16000)
+
+        for _ in 0..<200 where coordinator.state != .idle {
+            await Task.yield()
+        }
+
+        XCTAssertEqual(textInserter.insertedTexts, ["生の文字起こし結果"], "Ollama未検出時も原文へフォールバックするべき")
+        XCTAssertEqual(formattingUnavailableCount, 1, "Ollama未検出時はonFormattingUnavailableが1回呼ばれるべき")
+        XCTAssertEqual(formattingFailedCount, 0, "Ollama未検出時は5秒間のナグ警告(onFormattingFailed)を出すべきではない")
+    }
+
+    /// 整形が成功した場合は、Ollama未検出からの回復を示す`onFormattingRecovered`が呼ばれるべき
+    /// (メニューバーの「LLM整形: 無効(Ollama未検出)」表示を消す契機に使う)。
+    func testFormattingSuccessCallsOnFormattingRecovered() async {
+        Settings.formattingEnabled = true
+        let audioEngine = FakeAudioCaptureEngine()
+        let transcriptionEngine = ImmediateTranscriptionEngine(text: "えーっと、こんにちは")
+        let formatter = FixedTextFormatter(outcome: .success("こんにちは。"))
+        let clock = FakeClock()
+        let textInserter = FakeTextInserter()
+        let coordinator = Coordinator(audioEngine: audioEngine, transcriptionEngine: transcriptionEngine, textFormatter: formatter, textInserter: textInserter, now: clock.now)
+
+        var formattingRecoveredCount = 0
+        coordinator.onFormattingRecovered = { formattingRecoveredCount += 1 }
+
+        await coordinator.beginPushToTalk()
+        coordinator.endPushToTalk()
+        coordinator.audioCaptureEngine(audioEngine, didFinishRecording: nonSilentDummySamples, sampleRate: 16000)
+
+        for _ in 0..<200 where coordinator.state != .idle {
+            await Task.yield()
+        }
+
+        XCTAssertEqual(formattingRecoveredCount, 1, "整形成功時はonFormattingRecoveredが1回呼ばれるべき")
+    }
+
     /// HUD表示用の`onPhaseChanged`が、整形が実際に行われる場合は
     /// 認識中→整形中の順で通知されることを確認する(状態機械`AppState`自体は`.transcribing`のまま)。
     func testPhaseChangedNotifiesRecognizingThenFormattingWhenFormattingWillRun() async {
