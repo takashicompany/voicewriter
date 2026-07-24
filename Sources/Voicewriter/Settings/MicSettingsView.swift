@@ -12,6 +12,8 @@ struct MicSettingsView: View {
     @AppStorage(SettingsKey.onDemandIdleTimeoutSeconds) private var onDemandIdleTimeoutSeconds: Double = 5.0
 
     var body: some View {
+        // ウィンドウ高さより内容が長くなった場合でも見切れないよう、タブ内をScrollViewで包む。
+        ScrollView {
         Form {
             Section {
                 Picker("マイクモード", selection: $micMode) {
@@ -61,6 +63,7 @@ struct MicSettingsView: View {
             }
         }
         .padding()
+        }
     }
 
     private var explanationText: String {

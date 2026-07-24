@@ -13,6 +13,8 @@ struct ShortcutsSettingsView: View {
     var onCancelShortcutChanged: () -> Void = {}
 
     var body: some View {
+        // ウィンドウ高さより内容が長くなった場合でも見切れないよう、タブ内をScrollViewで包む。
+        ScrollView {
         Form {
             Section {
                 KeyboardShortcuts.Recorder("Push-to-Talk:", name: .pushToTalk)
@@ -38,5 +40,6 @@ struct ShortcutsSettingsView: View {
             }
         }
         .padding()
+        }
     }
 }

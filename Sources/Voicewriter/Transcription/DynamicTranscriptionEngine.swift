@@ -5,7 +5,7 @@ import os.log
 /// `Settings.sttEngine` / `Settings.sttLanguage` の変更を、次回の文字起こしから反映できるようにするラッパー。
 /// Coordinatorはこのインスタンス自体を固定の`TranscriptionEngine`として保持し続け、
 /// 設定画面から`reload()`が呼ばれるたびに内部で保持する実エンジン(whisper.cpp/stub)だけを差し替える。
-final class DynamicTranscriptionEngine: TranscriptionEngine, ObservableObject, @unchecked Sendable {
+final class DynamicTranscriptionEngine: TranscriptionEngine, TranscriptionEngineSnapshotProviding, ObservableObject, @unchecked Sendable {
     private let log = Logger(subsystem: "dev.voicewriter.app", category: "DynamicTranscriptionEngine")
     private let lock = NSLock()
     private var engine: TranscriptionEngine
@@ -86,6 +86,14 @@ final class DynamicTranscriptionEngine: TranscriptionEngine, ObservableObject, @
         return try await current.transcribe(samples: samples, sampleRate: sampleRate, language: language, vocabularyHint: vocabularyHint, vadEnabled: vadEnabled)
     }
 
+    /// `TranscriptionEngineSnapshotProviding`準拠: 呼び出し時点で実際に使われている実エンジンへの
+    /// 参照をそのまま返す(差し替えは行わない)。呼び出し元(`Coordinator`)は録音開始時にこれを呼び、
+    /// `DictationJob`へ焼き付けることで、待ち行列中に`reload()`が呼ばれても録音済みジョブは
+    /// 録音時点の実エンジンのまま処理され続ける。
+    func currentEngineSnapshot() -> TranscriptionEngine {
+        currentEngineSynchronized()
+    }
+
     /// asyncコンテキストから直接NSLockを呼ばないよう、同期関数越しにロックする。
     private func currentEngineSynchronized() -> TranscriptionEngine {
         lock.lock()
@@ -109,21 +117,47 @@ final class DynamicTranscriptionEngine: TranscriptionEngine, ObservableObject, @
         case .stub:
             return (StubTranscriptionEngine(), nil)
 
+        case .speechAnalyzer:
+            // SpeechAnalyzerストリーミングモードでは、通常`Coordinator`が`streamingSession`経由で
+            // 確定テキストを直接取得し、この`TranscriptionEngine.transcribe`(=ここで返すインスタンス)
+            // は呼ばれない(仕様: 最終テキストもSpeechAnalyzerの確定結果を使い、whisperは通さない)。
+            //
+            // 実機バグ修正の経緯: 以前はここで無条件に`StubTranscriptionEngine`(ダミーテキストを返す)を
+            // 返していた。`Coordinator.shouldUseStreamingForNewRecording`が何らかの理由でfalseになった
+            // 場合、この「実質呼ばれないはず」のプレースホルダーが実際に呼ばれ、ユーザーには何の警告も
+            // 無いままダミーテキストが挿入されてしまっていた。
+            //
+            // ここでwhisper.cppを毎回ロードするフォールバックも検討したが、`makeEngine`/`reload()`は
+            // ストリーミングが正常に機能している大多数のケースでも呼ばれるため、無条件にwhisperモデル
+            // (数百MB〜GB級)をロードするのは無駄なコスト(起動時間・メモリ・電力)になる
+            // (Codexレビュー指摘)。そのため、実際に呼ばれた場合は例外を投げる安全なプレースホルダー
+            // (`SpeechAnalyzerStreamingPlaceholderTranscriptionEngine`)を返す。呼ばれてしまった場合、
+            // `Coordinator.runJob`はこれを`.tombstone(.failed)`として扱い、ダミーテキストが
+            // サイレントに挿入されることはない。「ストリーミング利用不可時にwhisperへフォールバックする」
+            // という振る舞いは、より早い段階(`Coordinator.attemptStartRecording`の
+            // `onStreamingUnavailableFallback`通知、および`AppDelegate`が起動時/非同期チェックで
+            // `Settings.sttEngine`自体をwhisperCppへ補正する経路)で担保する。
+            return (SpeechAnalyzerStreamingPlaceholderTranscriptionEngine(), nil)
+
         case .whisperCpp:
-            let modelURL = WhisperCppEngine.defaultModelURL
-            guard WhisperCppEngine.isModelAvailable(at: modelURL) else {
-                let message = "whisper.cppモデルが未配置のため、スタブ文字起こしで動作しています。設定 > 音声認識 からダウンロードするか、scripts/download-model.sh を実行してモデルを配置してください。(\(modelURL.path))"
-                log.warning("\(message, privacy: .public)")
-                return (StubTranscriptionEngine(), message)
-            }
-            do {
-                let engine = try WhisperCppEngine(modelURL: modelURL)
-                return (engine, nil)
-            } catch {
-                let message = "whisper.cppモデルの読み込みに失敗したため、スタブ文字起こしで動作しています: \(error)"
-                log.error("\(message, privacy: .public)")
-                return (StubTranscriptionEngine(), message)
-            }
+            return makeWhisperCppEngine(log: log)
+        }
+    }
+
+    private static func makeWhisperCppEngine(log: Logger) -> (TranscriptionEngine, String?) {
+        let modelURL = WhisperCppEngine.defaultModelURL
+        guard WhisperCppEngine.isModelAvailable(at: modelURL) else {
+            let message = "whisper.cppモデルが未配置のため、スタブ文字起こしで動作しています。設定 > 音声認識 からダウンロードするか、scripts/download-model.sh を実行してモデルを配置してください。(\(modelURL.path))"
+            log.warning("\(message, privacy: .public)")
+            return (StubTranscriptionEngine(), message)
+        }
+        do {
+            let engine = try WhisperCppEngine(modelURL: modelURL)
+            return (engine, nil)
+        } catch {
+            let message = "whisper.cppモデルの読み込みに失敗したため、スタブ文字起こしで動作しています: \(error)"
+            log.error("\(message, privacy: .public)")
+            return (StubTranscriptionEngine(), message)
         }
     }
 }

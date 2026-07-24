@@ -27,12 +27,27 @@ final class StatusBarController {
     /// 「Ollama未導入は例外的な障害ではなく通常運用でありうる状態」という位置づけのため、
     /// 警告のような騒がしい見た目にはしない(アイコン変更もしない)。
     private let formattingStatusMenuItem: NSMenuItem
+    /// 「音声認識エンジン」サブメニューの各項目。設定画面のPicker(`TranscriptionSettingsView`)と
+    /// 選択肢を揃える(stubはデバッグ用のためここには出さない)。
+    private let engineMenuItem: NSMenuItem
+    private let engineSubmenu: NSMenu
+    private let engineWhisperItem: NSMenuItem
+    private let engineSpeechAnalyzerItem: NSMenuItem
     private let menu: NSMenu
     private var currentState: AppState = .idle
     private var warnings: [String] = []
     private var history: [HistoryEntry] = []
+    /// SpeechAnalyzerストリーミングモードがこの環境で選択可能かどうか。`AppDelegate`が
+    /// `StreamingTranscriptionAvailability.currentStatus()`(非同期)の結果を`updateSpeechAnalyzerAvailability`
+    /// 経由で流し込む。判定ロジック自体は設定画面(`TranscriptionSettingsView`)と共通のものを再利用し、
+    /// ここで再実装はしない。取得完了までは「未対応」側に倒し、誤って有効表示にしない。
+    private var speechAnalyzerAvailability = StreamingTranscriptionAvailabilityStatus(isSupported: false, reason: "確認中…")
     private let onOpenSettings: () -> Void
     private let onCancelAllJobs: () -> Void
+    /// メニューからのエンジン切替を受け取る。`Settings.sttEngine`への書き込みと
+    /// `DynamicTranscriptionEngine.reload()`は呼び出し側(`AppDelegate`)が持つ既存の1経路
+    /// (設定画面の`onChange`と同じ経路)をそのまま再利用し、ここでは二重実装しない。
+    private let onSelectEngine: (SttEngineKind) -> Void
 
     /// メニューバー用の自前グリフ(採用アイコン案icon-33のピクトグラムから抽出したマイク+ペン先)。
     /// `Resources/MenuBarIcon/menubar-icon.png`(@1x, 10x18px)と`menubar-icon@2x.png`(@2x, 20x36px)
@@ -63,9 +78,15 @@ final class StatusBarController {
         return image
     }()
 
-    init(coordinator: Coordinator, onOpenSettings: @escaping () -> Void, onCancelAllJobs: @escaping () -> Void) {
+    init(
+        coordinator: Coordinator,
+        onOpenSettings: @escaping () -> Void,
+        onCancelAllJobs: @escaping () -> Void,
+        onSelectEngine: @escaping (SttEngineKind) -> Void
+    ) {
         self.onOpenSettings = onOpenSettings
         self.onCancelAllJobs = onCancelAllJobs
+        self.onSelectEngine = onSelectEngine
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
 
         let menu = NSMenu()
@@ -89,6 +110,15 @@ final class StatusBarController {
 
         settingsMenuItem = NSMenuItem(title: "設定...", action: #selector(openSettings), keyEquivalent: ",")
 
+        // 音声認識エンジン切替サブメニュー。stub(デバッグ用、設定画面のみ)は意図的に含めない。
+        engineWhisperItem = NSMenuItem(title: Self.whisperTitle, action: #selector(selectWhisperEngine), keyEquivalent: "")
+        engineSpeechAnalyzerItem = NSMenuItem(title: Self.speechAnalyzerTitle, action: #selector(selectSpeechAnalyzerEngine), keyEquivalent: "")
+        engineSubmenu = NSMenu()
+        engineSubmenu.addItem(engineWhisperItem)
+        engineSubmenu.addItem(engineSpeechAnalyzerItem)
+        engineMenuItem = NSMenuItem(title: "音声認識エンジン", action: nil, keyEquivalent: "")
+        engineMenuItem.submenu = engineSubmenu
+
         historySubmenu = NSMenu()
         historyMenuItem = NSMenuItem(title: "最近の文字起こし結果", action: nil, keyEquivalent: "")
         historyMenuItem.submenu = historySubmenu
@@ -100,6 +130,10 @@ final class StatusBarController {
         // (target割り当ても含む)ため、生成をすべて済ませてからまとめてtargetを割り当てる。
         settingsMenuItem.target = self
         menu.addItem(settingsMenuItem)
+
+        engineWhisperItem.target = self
+        engineSpeechAnalyzerItem.target = self
+        menu.addItem(engineMenuItem)
 
         menu.addItem(historyMenuItem)
 
@@ -117,6 +151,46 @@ final class StatusBarController {
         applyIcon(for: .idle)
         coordinator.onStateChanged = { [weak self] state in
             self?.applyIcon(for: state)
+        }
+        refreshEngineMenu()
+    }
+
+    private static let whisperTitle = "Whisper(一括)"
+    private static let speechAnalyzerTitle = "SpeechAnalyzer(ストリーミング)"
+    // 半角括弧は既存の`TranscriptionSettingsView`の表記("Apple SpeechAnalyzer(ストリーミング)")に
+    // 揃えたもの。
+
+    /// 設定画面(`TranscriptionSettingsView`)からエンジンが切り替えられた場合に、メニューの
+    /// チェックマーク表示を同期させる。`DynamicTranscriptionEngine.onWarningChanged`
+    /// (`reload()`完了のたびに必ず呼ばれる、既存の配線)から`AppDelegate`経由で呼んでもらう想定。
+    func syncEngineSelectionDisplay() {
+        refreshEngineMenu()
+    }
+
+    /// SpeechAnalyzerストリーミングモードの可否判定結果を反映する。判定自体は
+    /// `StreamingTranscriptionAvailability.currentStatus()`(設定画面と共通)の結果を
+    /// `AppDelegate`から渡してもらうだけで、ここでは判定ロジックを再実装しない。
+    func updateSpeechAnalyzerAvailability(_ status: StreamingTranscriptionAvailabilityStatus) {
+        speechAnalyzerAvailability = status
+        refreshEngineMenu()
+    }
+
+    /// 「音声認識エンジン」サブメニューの選択状態(チェックマーク)・利用可否(disabled)を
+    /// 現在の`Settings.sttEngine`とキャッシュ済みの可用性判定から再計算する。
+    /// メニューを開くたびの表示だけでなく、切替直後・可用性判定到着時にも同じ関数で反映する
+    /// (表示ロジックを1箇所にまとめ、状態のずれを防ぐ)。
+    private func refreshEngineMenu() {
+        let current = Settings.sttEngine
+        engineWhisperItem.state = (current == .whisperCpp) ? .on : .off
+        engineSpeechAnalyzerItem.state = (current == .speechAnalyzer) ? .on : .off
+
+        engineSpeechAnalyzerItem.isEnabled = speechAnalyzerAvailability.isSupported
+        if let reason = speechAnalyzerAvailability.reason, !speechAnalyzerAvailability.isSupported {
+            engineSpeechAnalyzerItem.title = "\(Self.speechAnalyzerTitle) - 利用不可"
+            engineSpeechAnalyzerItem.toolTip = reason
+        } else {
+            engineSpeechAnalyzerItem.title = Self.speechAnalyzerTitle
+            engineSpeechAnalyzerItem.toolTip = nil
         }
     }
 
@@ -246,6 +320,27 @@ final class StatusBarController {
 
     @objc private func openSettings() {
         onOpenSettings()
+    }
+
+    @objc private func selectWhisperEngine() {
+        selectEngine(.whisperCpp)
+    }
+
+    @objc private func selectSpeechAnalyzerEngine() {
+        // 通常はdisabledでクリックできないはずだが、念のための二重防御。
+        guard speechAnalyzerAvailability.isSupported else { return }
+        selectEngine(.speechAnalyzer)
+    }
+
+    /// メニューからのエンジン切替の実処理。`Settings.sttEngine`書き込み+
+    /// `DynamicTranscriptionEngine.reload()`は`onSelectEngine`(`AppDelegate`側、設定画面の
+    /// `onChange`ハンドラと同一のロジック)へ委譲する。チェックマークは書き込みが同期的に
+    /// 完了した時点で即座に再計算し(実際のエンジン差し替え=`reload()`自体は非同期でモデル
+    /// ロードを伴いうるが、設定値と選択表示自体は待たずに即時反映する)。
+    private func selectEngine(_ kind: SttEngineKind) {
+        guard Settings.sttEngine != kind else { return }
+        onSelectEngine(kind)
+        refreshEngineMenu()
     }
 
     @objc private func copyHistoryEntry(_ sender: NSMenuItem) {

@@ -22,6 +22,10 @@ struct DictionarySettingsView: View {
     @ObservedObject private var store = UserDictionaryStore.shared
 
     var body: some View {
+        // ウィンドウ高さより内容(説明文+ルール一覧+フッタ)が長くなった場合でも見切れないよう、
+        // タブ内をScrollViewで包む。内側の行一覧用ScrollView(`.frame(minHeight: 140)`)は
+        // 高さが固定的なため、外側のスクロールと競合しない。
+        ScrollView {
         VStack(alignment: .leading, spacing: 8) {
             Text("音声認識・整形の結果テキストに対し、登録した「置換元→置換先」を上から順に適用してから挿入します。誤認識の確定修正(例: 「ボイスライダー」→「Voicewriter」)や、専門用語・固有名詞の表記統一に使えます。有効な置換先の語は、認識・整形の語彙ヒントにも自動的に追加されます。")
                 .font(.caption)
@@ -85,9 +89,14 @@ struct DictionarySettingsView: View {
             Text(store.fileURL.path)
                 .font(.footnote)
                 .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .help(store.fileURL.path)
                 .textSelection(.enabled)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding()
+        }
     }
 
     /// 指定した`index`の1件だけへの双方向バインディング。`TextField`へキー入力があるたびに

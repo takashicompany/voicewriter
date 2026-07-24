@@ -52,6 +52,30 @@ enum RecordingState: Equatable {
 /// (HUD/メニューバー配線用)。
 typealias DictationJobCommitEvent = DeliveryCommitResult
 
+/// 現在アクティブなストリーミングセッションへの、スレッドセーフな参照ホルダー。
+///
+/// `AudioCaptureEngine.onRecordingChunk`は`controlQueue`(MainActor外の専用シリアルキュー)から
+/// 直接(同期的に)呼ばれる。以前は`Coordinator.supplyStreamingAudioChunk`が
+/// `Task { @MainActor in self?.currentStreamingSession?.append(...) }`のように非構造化Taskで
+/// MainActorへホップしてから`currentStreamingSession`(MainActor隔離の可変状態)を読んでいたため、
+/// 「チャンクが実際にcontrolQueue上で捕捉された時点」と「セッション参照が実際に読まれる時点」の
+/// 間にタイムラグが生じ、その間に録音セッションが切り替わっていると、セッションNの遅延チャンクが
+/// セッションN+1へ混入しうった(Codexレビュー指摘#2)。このボックスはロックで保護されており、
+/// `controlQueue`から同期的・即座に(Taskを介さず)読めるため、この種のリオーダーが起こり得ない
+/// (チャンク捕捉と同じ関数呼び出しの中で、その時点の正しいセッションへ直接`append`する)。
+private final class StreamingSessionBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var session: StreamingTranscriptionSession?
+
+    func set(_ session: StreamingTranscriptionSession?) {
+        lock.lock(); self.session = session; lock.unlock()
+    }
+
+    func current() -> StreamingTranscriptionSession? {
+        lock.lock(); defer { lock.unlock() }; return session
+    }
+}
+
 /// idle / recording / transcribing の状態機械。全体の司令塔。
 ///
 /// 連続音声入力パイプライン: 前の発話の認識・整形中でも次の録音を即座に開始できるようにするため、
@@ -109,6 +133,15 @@ final class Coordinator: AudioCaptureEngineDelegate {
     /// ではなく通常運用でありうる状態のため、毎回のナグ通知を避ける)。メニューバーの
     /// 「LLM整形: 無効(Ollama未検出)」という常設の状態表示の切り替えに使う想定。
     var onFormattingUnavailable: (() -> Void)?
+    /// SpeechAnalyzerストリーミングモードの録音中、確定(finalized)/未確定(volatile)テキストが
+    /// 更新されるたびに呼ばれる(ライブプレビューパネル表示用)。挿入先アプリへは一切流し込まない
+    /// (仕様: volatileテキストは挿入しない。確定時に従来通り1回だけ挿入する)。
+    var onStreamingPreviewUpdate: ((_ finalizedText: String, _ volatileText: String) -> Void)?
+    /// ストリーミングのライブプレビューを隠すべきタイミング(録音終了/キャンセル/致命的エラー)で呼ばれる。
+    var onStreamingPreviewHide: (() -> Void)?
+    /// SpeechAnalyzerストリーミングモードで、モデル資産(言語モデル)が未インストールのため
+    /// 初回自動ダウンロード中であることの通知。`progress`は0.0〜1.0(不明ならnil)。
+    var onStreamingModelPreparing: ((Double?) -> Void)?
     /// LLM整形が成功した際に呼ばれる(整形自体が有効かつ実行された場合、成功のたびに毎回呼ばれる)。
     /// `onFormattingUnavailable`で立てた「Ollama未検出」の状態表示を元に戻す(後からOllamaが
     /// 起動された場合に、次の整形成功時点で自動的に状態表示を消すため)のに使う想定。
@@ -124,9 +157,20 @@ final class Coordinator: AudioCaptureEngineDelegate {
     /// セットアップ中(`isModelSetupBlocking == true`)に録音開始が要求され、拒否した際に呼ばれる
     /// (HUDの「セットアップ中です」表示用)。
     var onRecordingRejectedDuringSetup: (() -> Void)?
+    /// `Settings.sttEngine == .speechAnalyzer`が選択されているにもかかわらず、この録音では
+    /// (`streamingEngine`が実行時に注入されていない等の理由で)SpeechAnalyzerストリーミング
+    /// セッションを生成できず、whisper.cppへフォールバックして処理することになった際に呼ばれる。
+    /// 引数は理由を含むメッセージ。黙ってフォールバックさせず、メニューバー/HUDでユーザーに
+    /// 通知するための配線用(実機バグ「ライブプレビュー/挿入テキストが一切出ない」の再発防止:
+    /// このケースで無警告のままダミーテキスト(スタブ)が処理されることも別途
+    /// `DynamicTranscriptionEngine`側で防いでいるが、こちらはユーザーへの可視化を担う)。
+    var onStreamingUnavailableFallback: ((String) -> Void)?
 
     private let audioEngine: AudioCaptureEngineControlling
     private let transcriptionEngine: TranscriptionEngine
+    /// SpeechAnalyzerストリーミングモード用エンジン。`nil`ならこのモードは常に無効
+    /// (macOS 26未満のビルド/実行環境、または`AppDelegate`が非対応と判定した場合)。
+    private let streamingEngine: StreamingTranscriptionEngine?
     /// 音声認識結果の整形に使うLLMフォーマッタ。`nil`なら整形自体を行わない(未整形のまま挿入)。
     private let textFormatter: TextFormatter?
 
@@ -148,6 +192,11 @@ final class Coordinator: AudioCaptureEngineDelegate {
     private var recordingFrontmostApp: NSRunningApplication?
     private var recordingStartedAt: Date?
     private var pendingJobSettingsSnapshot: DictationJobSettingsSnapshot?
+    /// 録音開始時点で捕捉した、バッチ(whisper.cpp)モード用の実`TranscriptionEngine`参照。
+    /// `pendingJobSettingsSnapshot`と同じ理由(録音開始時点のスナップショット化)により、
+    /// `attemptStartRecording`で捕捉し`didFinishRecording`で`DictationJob.batchTranscriptionEngine`
+    /// へ切り出す。詳細は`DictationJob.batchTranscriptionEngine`のドキュメント参照。
+    private var pendingBatchTranscriptionEngine: TranscriptionEngine?
     /// 現在録音中(または録音停止グレー中)のジョブの`sequence`。仕様通り「録音開始時」に採番し、
     /// `didFinishRecording`/`didCancelRecording`/`didEncounterFatalError`のいずれでも、この値を
     /// そのまま該当ジョブの終端処理に使う(録音終了時に改めて採番はしない)。これにより、
@@ -157,6 +206,23 @@ final class Coordinator: AudioCaptureEngineDelegate {
     /// `.finalizing`中(録音停止済みグレー待ち)にホットキーで新規録音が要求された場合、
     /// ここに保留し、グレースが明けた直後(`finalizeRecordingTransition()`)に自動的に開始する。
     private var pendingStartRequest: ActivationSource?
+    /// 現在録音中(または録音停止グレー中)のSpeechAnalyzerストリーミングセッション。
+    /// whisper.cppモードの録音では常にnil。`didFinishRecording`で`DictationJob.streamingSession`へ
+    /// 切り出し、それ以外(キャンセル/致命的エラー)の経路では即座に`cancel()`してから`nil`に戻す。
+    /// このプロパティを変更する箇所は必ず`streamingSessionBox`も同じ値に同期させること
+    /// (`supplyStreamingAudioChunk`がcontrolQueueから同期的に読むための複製)。
+    private var currentStreamingSession: StreamingTranscriptionSession?
+    /// `currentStreamingSession`のスレッドセーフな複製(詳細は`StreamingSessionBox`参照)。
+    private let streamingSessionBox = StreamingSessionBox()
+    /// 現在録音中(または録音停止グレー中)のセッションに対応するライブプレビュー世代ID。
+    /// `didFinishRecording`で`DictationJob.streamingPreviewGeneration`へ切り出す
+    /// (`pendingBatchTranscriptionEngine`と同じスナップショットの考え方)。
+    private var pendingStreamingPreviewGeneration: Int?
+    /// ライブプレビューイベントの世代カウンタ。セッションが切り替わる(または終了する)たびに
+    /// 新しい世代を発行し、古い世代に属するイベント(既に終了/キャンセル済みのセッションからの
+    /// 遅延イベント)を破棄する(Codexレビュー指摘#6: セッションN終了後の遅延イベントが
+    /// パネルを再表示したり、既にN+1が始まっている表示を上書きしてしまいうった)。
+    private let streamingPreviewGeneration = GenerationCounter()
     /// PTT(Push-to-Talk)キーが現在押されているか。`beginPushToTalk()`でtrueに、
     /// `endPushToTalk()`でfalseにする。`finalizing`中の保留や挿入クリティカル区間待機など、
     /// 非同期の`await`を挟んでから実際に録音を開始する経路で、開始直前にキーが既に
@@ -186,6 +252,7 @@ final class Coordinator: AudioCaptureEngineDelegate {
     init(
         audioEngine: AudioCaptureEngineControlling,
         transcriptionEngine: TranscriptionEngine,
+        streamingEngine: StreamingTranscriptionEngine? = nil,
         textFormatter: TextFormatter? = nil,
         textInserter: TextInserting? = nil,
         now: @escaping () -> Date = Date.init,
@@ -194,6 +261,7 @@ final class Coordinator: AudioCaptureEngineDelegate {
     ) {
         self.audioEngine = audioEngine
         self.transcriptionEngine = transcriptionEngine
+        self.streamingEngine = streamingEngine
         self.textFormatter = textFormatter
         self.now = now
         self.maxUnterminatedJobs = maxUnterminatedJobs ?? Self.maxUnterminatedJobs
@@ -330,12 +398,18 @@ final class Coordinator: AudioCaptureEngineDelegate {
             }
             activationSource = nil
             recordingState = .finalizing
+            cancelCurrentStreamingSessionIfAny()
             audioEngine.cancelRecording()
         case .finalizing:
             if let sequence = currentRecordingSequence {
                 jobRegistry.requestCancel(sequence)
                 log.info("Cancel requested for the recording currently being finalized (sequence \(sequence, privacy: .public))")
             }
+            // 既にstopRecording()済み(finalizing中)のため、この録音はdidFinishRecording経由で
+            // 通常通り確定するが、直前でrequestCancelしたためrunJob側の先頭ガードでスキップされる。
+            // ストリーミングセッションを繋いだままにしておくと(誰も finish()/cancel() を呼ばず)
+            // バックグラウンドの購読Taskが残り続けてしまうため、ここで明示的に後始末する。
+            cancelCurrentStreamingSessionIfAny()
         case .idle:
             if let sequence = jobRegistry.latestCancellableSequence {
                 jobRegistry.requestCancel(sequence)
@@ -366,7 +440,69 @@ final class Coordinator: AudioCaptureEngineDelegate {
         }
     }
 
+    // MARK: - SpeechAnalyzerストリーミング
+
+    /// この録音でSpeechAnalyzerストリーミングモードを使うべきか。`streamingEngine`が注入されている
+    /// (=macOS 26以降かつ`AppDelegate`が対応環境と判定済み)、かつ設定で選択されている場合のみtrue。
+    private var shouldUseStreamingForNewRecording: Bool {
+        streamingEngine != nil && Settings.sttEngine == .speechAnalyzer
+    }
+
+    /// `AudioCaptureEngine.onRecordingChunk`から呼ぶ想定。録音中の16kHz/mono/Float32チャンクを
+    /// 現在のストリーミングセッション(あれば)へ中継する。`controlQueue`(MainActor外の同期シリアル
+    /// キュー)から直接、同期的に呼ばれる想定であり、意図的にTask/MainActorへのホップを行わない
+    /// (Codexレビュー指摘#2: 以前は`Task { @MainActor in ... }`でホップしてから
+    /// `currentStreamingSession`を読んでいたため、チャンク捕捉時点とセッション参照の読み取り時点の
+    /// 間にタイムラグが生じ、セッション切り替えと競合してセッションNの遅延チャンクがN+1へ
+    /// 混入しうった。`streamingSessionBox`はロック保護されており、チャンクを捕捉したその場で
+    /// 同期的に読めるため、この種のリオーダーが起こらない)。ストリーミングセッションが無ければ
+    /// (=whisperモード)ロック取得とnilチェックのみの軽量なno-opになる(Codexレビュー指摘#9:
+    /// 以前はwhisperモードでもチャンクごとに空のMainActor Taskが生成されていた)。
+    nonisolated func supplyStreamingAudioChunk(_ samples: [Float], sampleRate: Double) {
+        streamingSessionBox.current()?.append(samples: samples, sampleRate: sampleRate)
+    }
+
+    /// `StreamingTranscriptionEngine.makeSession`の`onEvent`から呼ばれる(MainActorへホップ済み)。
+    /// `generation`が発行時点と異なる(=既にこのセッションが終了/キャンセル済みで、新しい世代が
+    /// 発行されている)場合はイベントを破棄する(Codexレビュー指摘#6)。
+    private func handleStreamingEvent(_ event: StreamingTranscriptionEvent, generation: Int) {
+        guard streamingPreviewGeneration.isCurrent(generation) else { return }
+        switch event {
+        case .update(let finalizedText, let volatileText):
+            // 診断ログ: 「録音中にライブプレビューが更新されているか」を実機のos.logタイムスタンプで
+            // 確認できるようにする(実機バグ「発話中にプレビューが一切表示されない」の再発防止用。
+            // 文字数のみを記録し、本文自体は`privacy: .private`でログへ出さない)。
+            log.debug("Streaming preview update (generation \(generation, privacy: .public)): finalizedLen=\(finalizedText.count, privacy: .public) volatileLen=\(volatileText.count, privacy: .public) recordingState=\(String(describing: self.recordingState), privacy: .public)")
+            onStreamingPreviewUpdate?(finalizedText, volatileText)
+        case .preparing(let progress):
+            onStreamingModelPreparing?(progress)
+        }
+    }
+
+    /// 現在のストリーミングセッションを即座にキャンセルし、後始末する(誰も`finish()`を呼ばない
+    /// 経路(Escキャンセル等)で、バックグラウンドの購読Task/AsyncStreamが残り続けないようにするため)。
+    /// 世代も同時に進め、このセッションからの遅延イベント(Escキャンセル直後にまだ飛んでくる
+    /// 可能性のあるイベント)がプレビューを再表示しないようにする(Codexレビュー指摘#6)。
+    private func cancelCurrentStreamingSessionIfAny() {
+        guard let session = currentStreamingSession else { return }
+        session.cancel()
+        currentStreamingSession = nil
+        streamingSessionBox.set(nil)
+        streamingPreviewGeneration.next()
+        onStreamingPreviewHide?()
+    }
+
     // MARK: - Recording start (共通化)
+
+    /// バッチ(whisper.cpp)モード用に、その時点で実際に使われている実`TranscriptionEngine`を
+    /// 捕捉する。`transcriptionEngine`が`TranscriptionEngineSnapshotProviding`
+    /// (`DynamicTranscriptionEngine`が準拠)に準拠していればその内部の実エンジンを返し、
+    /// 準拠していない場合(テスト用フェイク等、`reload()`で差し替わることのない実装)は
+    /// `transcriptionEngine`自体をそのまま返す。詳細は`DictationJob.batchTranscriptionEngine`
+    /// のドキュメント参照。
+    private func captureBatchTranscriptionEngineSnapshot() -> TranscriptionEngine {
+        (transcriptionEngine as? TranscriptionEngineSnapshotProviding)?.currentEngineSnapshot() ?? transcriptionEngine
+    }
 
     /// 新規録音の開始を試みる。キュー上限到達時は`onQueueFull`を通知して開始せず`false`を返す
     /// (呼び出し元は`recordingState`を適切な状態に戻すこと。特に`.finalizing`からの遷移では、
@@ -395,9 +531,54 @@ final class Coordinator: AudioCaptureEngineDelegate {
         recordingFrontmostApp = NSWorkspace.shared.frontmostApplication
         recordingStartedAt = now()
         pendingJobSettingsSnapshot = .captureCurrent(dictionaryRules: dictionaryProvider())
+        pendingBatchTranscriptionEngine = captureBatchTranscriptionEngineSnapshot()
         currentRecordingSequence = jobRegistry.beginJob()
         recordingState = .recording
         onPendingJobCountChanged?(jobRegistry.activeCount)
+
+        // 診断ログ: どちらの経路(ストリーミング/バッチ)で録音が処理されるかを、録音開始の
+        // 時点で必ず1行残す。以前はここに何のログも無く、sttEngine==speechAnalyzerでも
+        // 実際にはstreamingEngineがnilでバッチ(スタブ)経路へ静かに落ちるケースが外形から
+        // 判別できなかった(実機バグ調査で原因特定に時間がかかった経緯があるため、恒久的に残す)。
+        log.info("attemptStartRecording: sttEngine=\(Settings.sttEngine.rawValue, privacy: .public), streamingEngineInjected=\(self.streamingEngine != nil, privacy: .public), willUseStreaming=\(self.shouldUseStreamingForNewRecording, privacy: .public)")
+
+        // Codexレビュー指摘: 新しい録音が始まるたびに、ストリーミング/バッチいずれであっても
+        // 必ず世代を1つ進め、残存するライブプレビューを隠す。
+        // - 前の録音がストリーミングだった場合、その録音の`finish()`がまだ解決していなくても
+        //   (=`runJob`の`defer`による非表示がまだ済んでいなくても)、この新しい録音の開始時点で
+        //   確実に世代が進むため、前の録音からの遅延イベントは(このあと新しい録音がストリーミング
+        //   でもバッチでも)常に古い世代と判定されて破棄される。以前はバッチ録音への切替時には
+        //   世代を進めていなかったため、前のストリーミング録音の遅延結果がバッチ録音中の
+        //   プレビューパネルに紛れ込みうる隙間があった。
+        // - 前の録音のプレビューがまだ画面に残っている場合(前のジョブがまだ処理中で`defer`による
+        //   非表示が間に合っていない場合)も、ここで即座に隠すことで、新しい録音中に無関係な
+        //   古いテキストが表示され続ける事態を防ぐ。
+        let generation = streamingPreviewGeneration.next()
+        onStreamingPreviewHide?()
+
+        if shouldUseStreamingForNewRecording, let streamingEngine {
+            let session = streamingEngine.makeSession { [weak self] event in
+                Task { @MainActor in
+                    self?.handleStreamingEvent(event, generation: generation)
+                }
+            }
+            currentStreamingSession = session
+            streamingSessionBox.set(session)
+            pendingStreamingPreviewGeneration = generation
+            log.info("Streaming session created (generation \(generation, privacy: .public))")
+        } else {
+            currentStreamingSession = nil
+            streamingSessionBox.set(nil)
+            pendingStreamingPreviewGeneration = nil
+            if Settings.sttEngine == .speechAnalyzer {
+                log.warning("sttEngine=speechAnalyzer but no streaming session was created (streamingEngine=\(self.streamingEngine != nil, privacy: .public)); falling back to batch engine (likely stub placeholder)")
+                let reason = self.streamingEngine == nil
+                    ? "この端末/実行環境ではSpeechAnalyzerストリーミングが利用できません"
+                    : "SpeechAnalyzerストリーミングの初期化に失敗しました"
+                onStreamingUnavailableFallback?("\(reason)。whisper.cppにフォールバックして処理します。")
+            }
+        }
+
         audioEngine.startRecording()
         return true
     }
@@ -454,6 +635,7 @@ final class Coordinator: AudioCaptureEngineDelegate {
             let frontmostAppAtRecordingStart = recordingFrontmostApp
             let effectiveDuration = recordingStartedAt.map { now().timeIntervalSince($0) } ?? .infinity
             let settingsSnapshot = pendingJobSettingsSnapshot ?? .captureCurrent(dictionaryRules: dictionaryProvider())
+            let batchTranscriptionEngine = pendingBatchTranscriptionEngine ?? captureBatchTranscriptionEngineSnapshot()
             // 仕様通り、sequenceは録音開始時(attemptStartRecording)に既に採番済み。
             // 万一nilの場合(理論上到達しないはずだが、安全側のフォールバック)はここで採番する。
             let sequence = currentRecordingSequence ?? {
@@ -463,7 +645,41 @@ final class Coordinator: AudioCaptureEngineDelegate {
             recordingFrontmostApp = nil
             recordingStartedAt = nil
             pendingJobSettingsSnapshot = nil
+            pendingBatchTranscriptionEngine = nil
             currentRecordingSequence = nil
+            let streamingSession = currentStreamingSession
+            let streamingPreviewGenerationForJob = pendingStreamingPreviewGeneration
+            currentStreamingSession = nil
+            streamingSessionBox.set(nil)
+            pendingStreamingPreviewGeneration = nil
+            // 重要(実機バグ修正): 以前はここで世代を即座に進め、`onStreamingPreviewHide`を
+            // 呼んでいた。しかし実機検証(フィクスチャWAVをCoordinator経由で等速供給する統合テスト、
+            // `CoordinatorSpeechAnalyzerFixtureIntegrationTests`)の過程で、`SpeechTranscriber`の
+            // `reportingOptions`に`.volatileResults`しか指定していなかったこの検証環境では、
+            // `.update`イベントが録音中に一切発行されず、`finish()`(`finalizeAndFinishThroughEndOfInput`)
+            // 呼び出し後にまとめて全volatile→final結果が発行される挙動が確認された
+            // (以後`.fastResults`を追加するワークアラウンドで解消。詳細は`SpeechTranscriberFactory`の
+            // ドキュメントコメント参照)。この修正後は録音中から`.update`が継続的に届くようになったが、
+            // 録音停止と同時に世代を進めてしまうと、
+            // 停止直前後にまとめて届く可能性のある結果(=このセッションの文字起こし結果そのもの、
+            // 真の意味で古い世代のイベントではない)が発行済みの古い世代と判定され、ライブプレビューの
+            // 末尾が表示されなくなる余地が残る。そのため「録音停止と同時に世代を進めない」という
+            // この設計自体は、`.fastResults`修正後も引き続き安全側の保険として維持する。
+            // 世代を進めるのは「新しい録音が実際に始まったとき」(`attemptStartRecording`)と
+            // 「明示的にキャンセルされたとき」(`cancelCurrentStreamingSessionIfAny`)のみとし、
+            // このセッションの完了(`finish()`の解決)自体は`runJob`側で検知して隠す
+            // (下記`runJob`冒頭の`defer`参照)。これにより、Codexレビュー指摘#6が本来防ぎたかった
+            // 「新しい録音のプレビューを古い録音の遅延イベントが上書きする」ケースは
+            // (世代が新しい録音開始時点で既に進んでいるため)引き続き防止されたまま、
+            // 「録音停止後にまとめて届く正当な結果まで握りつぶす」という副作用だけを取り除く。
+            //
+            // ここでの`onStreamingPreviewHide?()`自体は残す(「録音が終わった」ことを視覚的に
+            // 即座に伝えるため、一旦フェードアウトする)。世代を進めていないため、直後に
+            // finalize中の結果が`onStreamingPreviewUpdate`で届けば`StreamingPreviewController.update`
+            // が再度パネルを表示する(`update`は`show()`を呼ぶため、`hide()`直後でも問題なく
+            // 再表示できる)。最終的な非表示は、`runJob`が`finish()`の解決を検知した時点
+            // (下記`defer`)で確実に行う。
+            onStreamingPreviewHide?()
 
             let job = DictationJob(
                 sequence: sequence,
@@ -471,7 +687,10 @@ final class Coordinator: AudioCaptureEngineDelegate {
                 sampleRate: sampleRate,
                 effectiveRecordingDuration: effectiveDuration,
                 frontmostAppAtRecordingStart: frontmostAppAtRecordingStart,
-                settings: settingsSnapshot
+                settings: settingsSnapshot,
+                streamingSession: streamingSession,
+                streamingPreviewGeneration: streamingPreviewGenerationForJob,
+                batchTranscriptionEngine: batchTranscriptionEngine
             )
 
             // 保留中の開始要求があれば直ちに次の録音を始める(このジョブの処理とは完全に独立)。
@@ -488,7 +707,12 @@ final class Coordinator: AudioCaptureEngineDelegate {
             recordingFrontmostApp = nil
             recordingStartedAt = nil
             pendingJobSettingsSnapshot = nil
+            pendingBatchTranscriptionEngine = nil
+            pendingStreamingPreviewGeneration = nil
             currentRecordingSequence = nil
+            // 通常は`cancelRecording()`が既にここを済ませているはずだが、念のための防御
+            // (冪等: セッションが既にnilなら何もしない)。
+            cancelCurrentStreamingSessionIfAny()
             finalizeRecordingTransition()
             // sequenceは録音開始時に既に採番済み(未終端としてカウントされている)ため、
             // 実際に音声が得られなかったこのケースでも必ずtombstone化して終端させる
@@ -509,8 +733,11 @@ final class Coordinator: AudioCaptureEngineDelegate {
                 recordingFrontmostApp = nil
                 recordingStartedAt = nil
                 pendingJobSettingsSnapshot = nil
+                pendingBatchTranscriptionEngine = nil
+                pendingStreamingPreviewGeneration = nil
                 pendingStartRequest = nil
                 currentRecordingSequence = nil
+                cancelCurrentStreamingSessionIfAny()
                 recordingState = .idle
                 // sequence採番を録音開始時に前倒ししたため、致命的エラー時も同様に
                 // 必ず終端させてキュー上限の枠を解放する。
@@ -550,7 +777,32 @@ final class Coordinator: AudioCaptureEngineDelegate {
             deliveryCoordinator.complete(sequence: job.sequence, outcome: outcome, frontmostAppAtRecordingStart: job.frontmostAppAtRecordingStart)
         }
 
+        // 実機バグ修正: ストリーミングジョブの場合、この関数を抜ける経路(キャンセル/短すぎる/無音/
+        // 正常終了/失敗のいずれでも)で、まだ最新世代であれば(=この録音の後により新しい録音が
+        // 始まっていなければ)ライブプレビューを隠す。`didFinishRecording`は録音停止と同時に
+        // 世代を進めなくなった(下記`SpeechAnalyzerSession`のコメント参照)ため、`finish()`の
+        // finalizeバーストで届く結果が表示され続けた後、この`defer`が最終的な非表示を担う。
+        // 世代が既に追い越されている(次の録音が既に始まっている)場合は、その録音自身のプレビューを
+        // 誤って隠してしまわないよう何もしない。
+        defer {
+            if let generation = job.streamingPreviewGeneration, streamingPreviewGeneration.isCurrent(generation) {
+                onStreamingPreviewHide?()
+            }
+        }
+
+        // Codexレビュー指摘#1(ブロッキング): ストリーミングセッションを持つジョブが、この関数の
+        // 早期return(キャンセル済み/短すぎる/無音)で`streamingSession.finish()`を一度も呼ばずに
+        // 終端すると、そのセッションのバックグラウンドTask(`for await rawStream`)が
+        // 誰にも`finish()`/`cancel()`されないまま永久にサスペンドし続け、リークする。
+        // 無音・誤押下による早期スキップは日常的に起きるため、早期returnする全ての経路で
+        // 必ずこれを呼び、セッションを確実に後始末する(`cancel()`は`finish()`済みのセッションに
+        // 対しては冪等にno-opなので、`job.streamingSession`がnilでなければ常に呼んでよい)。
+        func cancelStreamingSessionIfAbandoningWithoutFinishing() {
+            job.streamingSession?.cancel()
+        }
+
         guard !jobRegistry.isCancelled(job.sequence) else {
+            cancelStreamingSessionIfAbandoningWithoutFinishing()
             complete(.tombstone(.cancelled))
             return
         }
@@ -558,6 +810,7 @@ final class Coordinator: AudioCaptureEngineDelegate {
         // ハルシネーション対策(多層防御)の第1層: 録音実効長が閾値未満ならwhisper_full自体を呼ばない。
         guard job.effectiveRecordingDuration >= Self.minimumEffectiveRecordingDuration else {
             log.info("Recording effective duration (\(job.effectiveRecordingDuration, privacy: .public)s) below minimum; skipping transcription (sequence \(job.sequence, privacy: .public))")
+            cancelStreamingSessionIfAbandoningWithoutFinishing()
             complete(.tombstone(.skipped(.tooShort)))
             return
         }
@@ -566,19 +819,34 @@ final class Coordinator: AudioCaptureEngineDelegate {
         let trimmedForEnergyCheck = AudioPreprocessing.trimLeadingSilence(samples: job.samples, sampleRate: job.sampleRate)
         guard AudioPreprocessing.hasSufficientEnergy(samples: trimmedForEnergyCheck, sampleRate: job.sampleRate) else {
             log.info("No sufficient speech energy detected; skipping transcription (sequence \(job.sequence, privacy: .public))")
+            cancelStreamingSessionIfAbandoningWithoutFinishing()
             complete(.tombstone(.skipped(.silence)))
             return
         }
 
         onPhaseChanged?(.recognizing)
         do {
-            let transcribedText = try await transcriptionEngine.transcribe(
-                samples: job.samples,
-                sampleRate: job.sampleRate,
-                language: job.settings.sttLanguage,
-                vocabularyHint: job.settings.vocabularyHint,
-                vadEnabled: job.settings.vadEnabled
-            )
+            let transcribedText: String
+            if let streamingSession = job.streamingSession {
+                // SpeechAnalyzerストリーミングモード: 最終テキストもSpeechAnalyzerの確定結果を使う
+                // (仕様により、whisper.cppは一切呼ばない)。`finish()`は録音中に逐次届いていた
+                // volatile/final結果の最終形(確定テキスト全体)を返す。
+                transcribedText = try await streamingSession.finish()
+            } else {
+                // バグ修正: ここは共有の`transcriptionEngine`(設定変更のたびに`reload()`で内部の
+                // 実エンジンが差し替わりうる`DynamicTranscriptionEngine`)を直接呼ぶのではなく、
+                // 録音開始時点に捕捉した`job.batchTranscriptionEngine`を使う。こうすることで、
+                // whisper.cppで録音済み・認識待ちのジョブが待ち行列中にエンジン設定を切り替えられても、
+                // 録音時点に実際に使われていた実エンジンで処理され続ける
+                // (詳細は`DictationJob.batchTranscriptionEngine`のドキュメント参照)。
+                transcribedText = try await job.batchTranscriptionEngine.transcribe(
+                    samples: job.samples,
+                    sampleRate: job.sampleRate,
+                    language: job.settings.sttLanguage,
+                    vocabularyHint: job.settings.vocabularyHint,
+                    vadEnabled: job.settings.vadEnabled
+                )
+            }
             log.info("Transcription result (sequence \(job.sequence, privacy: .public)): \(transcribedText, privacy: .private)")
 
             guard !jobRegistry.isCancelled(job.sequence) else {

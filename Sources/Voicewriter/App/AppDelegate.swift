@@ -1,6 +1,7 @@
 import AppKit
 import AVFoundation
 import Combine
+import Speech
 import os.log
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -11,6 +12,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var hotkeyManager: HotkeyManager?
     private var settingsWindowController: SettingsWindowController?
     private var statusHUDController: StatusHUDController?
+    private var streamingPreviewController: StreamingPreviewController?
     private var transcriptionEngine: DynamicTranscriptionEngine?
     private var lastEngineWarning: String?
     private let audioEngine = AudioCaptureEngine()
@@ -49,9 +51,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // stubへ切り替えている場合は、その選択を尊重して自動ダウンロードは行わない。
         let willAutoDownloadModel = Settings.sttEngine == .whisperCpp && !WhisperCppEngine.isModelAvailable()
 
+        // SpeechAnalyzerストリーミングモード用エンジン。ここでは軽量な同期チェック(macOSバージョン+
+        // `SpeechTranscriber.isAvailable`)のみで構築可否を判定する(日本語ロケール対応の詳細な非同期
+        // 照会は、起動をブロックしないよう下の`Task`で別途行い、必要なら設定を安全側へ補正する)。
+        // 実際にこのモードが選択可能かどうかの正式な判定(設定UIのグレーアウト)は
+        // `StreamingTranscriptionAvailability.currentStatus()`(非同期、ja-JPロケール確認込み)が担う。
+        var streamingEngine: StreamingTranscriptionEngine?
+        if #available(macOS 26.0, *), SpeechTranscriber.isAvailable {
+            streamingEngine = SpeechAnalyzerEngine(
+                locale: Locale(identifier: StreamingTranscriptionAvailability.targetLocaleIdentifier)
+            )
+        }
+
         let coordinator = Coordinator(
             audioEngine: audioEngine,
             transcriptionEngine: transcriptionEngine,
+            streamingEngine: streamingEngine,
             textFormatter: textFormatter,
             textInserter: textInserter
         )
@@ -65,6 +80,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             },
             onCancelAllJobs: { [weak coordinator] in
                 coordinator?.cancelAllJobs()
+            },
+            onSelectEngine: { [weak transcriptionEngine] kind in
+                // 設定画面(`TranscriptionSettingsView`)のPickerの`onChange`と全く同じ経路
+                // (`Settings`書き込み+`DynamicTranscriptionEngine.reload()`)を再利用する。
+                // ここでは二重に判定/実装しない。
+                Settings.sttEngine = kind
+                transcriptionEngine?.reload()
             }
         )
         self.statusBarController = statusBarController
@@ -72,6 +94,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // HotkeyManagerの構築(ハンドラ登録)がキャンセルショートカットを再度有効化してしまうため、
         // Coordinator.initでのdisable状態を再適用する(起動時にEscが一時的に有効化される問題の対策)。
         coordinator.refreshShortcutEnablement()
+
+        // 仕様: macOS 26未満、またはSpeechTranscriberがja非対応の環境では、SpeechAnalyzerストリーミング
+        // モードを選択不可とし、その場合は従来のwhisperのみとする。永続化された設定が
+        // (OSダウングレード等により)この環境で選択不可なstreamingEngine==nilのまま`.speechAnalyzer`を
+        // 指しているケースをここで補正する。
+        if Settings.sttEngine == .speechAnalyzer, streamingEngine == nil {
+            log.warning("Persisted sttEngine=speechAnalyzer is unsupported on this OS; falling back to whisperCpp")
+            Settings.sttEngine = .whisperCpp
+            statusBarController.addWarning("この環境ではSpeechAnalyzerストリーミングを利用できないため、whisper.cppに切り替えました(macOS 26以降が必要です)。")
+        } else if streamingEngine != nil {
+            // 同期チェックは通ったが、日本語ロケール対応の詳細な非同期照会はまだ済んでいない。
+            // 起動をブロックせずバックグラウンドで確認し、実は非対応だった場合のみ安全側へ補正する。
+            Task { @MainActor [weak self, weak statusBarController] in
+                let status = await StreamingTranscriptionAvailability.currentStatus()
+                guard !status.isSupported, Settings.sttEngine == .speechAnalyzer else { return }
+                Settings.sttEngine = .whisperCpp
+                self?.transcriptionEngine?.reload()
+                let message = "この環境ではSpeechAnalyzerストリーミングを利用できないため、whisper.cppに切り替えました: \(status.reason ?? "")"
+                statusBarController?.addWarning(message)
+            }
+        }
 
         // 状態表示HUD(録音中/認識・整形中/挿入完了)の配線。`onStateChanged`は既に
         // StatusBarControllerがアイコン更新用に設定済みのため、上書きしないよう一旦保持してから
@@ -98,6 +141,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusHUDController?.updateLevel(rms)
         }
 
+        // SpeechAnalyzerストリーミングモードのライブプレビューパネル(既存の状態表示HUDとは別パネル、
+        // 詳細は`StreamingPreviewController`参照)。録音中の音声チャンクをCoordinator経由でセッションへ
+        // fan-outする配線もここで行う(whisperモードでは`currentStreamingSession`が常にnilのため、
+        // このコールバック自体は無害な no-op になる)。
+        let streamingPreviewController = StreamingPreviewController()
+        self.streamingPreviewController = streamingPreviewController
+        coordinator.onStreamingPreviewUpdate = { [weak streamingPreviewController] finalizedText, volatileText in
+            streamingPreviewController?.update(finalizedText: finalizedText, volatileText: volatileText)
+        }
+        coordinator.onStreamingPreviewHide = { [weak streamingPreviewController] in
+            streamingPreviewController?.hide()
+        }
+        coordinator.onStreamingModelPreparing = { [weak streamingPreviewController] progress in
+            streamingPreviewController?.showPreparing(progress: progress)
+        }
+        audioEngine.onRecordingChunk = { [weak coordinator] samples, sampleRate in
+            coordinator?.supplyStreamingAudioChunk(samples, sampleRate: sampleRate)
+        }
+
         // モデル未配置により自動ダウンロードを開始する場合は、恒常的な「スタブで動作中」警告は
         // 出さない(これから自動的に解消するため)。HUD(セットアップ進捗)とメニューバーの
         // 状態表示は下の`modelDownloader`まわりの配線が別途担う。それ以外の場合(エンジンを
@@ -108,6 +170,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             lastEngineWarning = engineWarning
         }
         // 設定画面からのエンジン/言語変更でフォールバック状態が変わったら、メニューバーの警告も同期する。
+        // `onWarningChanged`は`reload()`(=`Settings.sttEngine`変更のたび、設定画面・メニューバー
+        // いずれの経路からでも)完了後に必ず呼ばれるため、ここでメニューバーのエンジン選択
+        // チェックマーク表示も併せて同期させる(設定画面から切り替えた場合にメニューバー側の
+        // 表示が古いままにならないようにするため)。
         transcriptionEngine.onWarningChanged = { [weak self, weak statusBarController] newWarning in
             guard let self, let statusBarController else { return }
             if let old = self.lastEngineWarning, old != newWarning {
@@ -117,6 +183,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 statusBarController.addWarning(newWarning)
             }
             self.lastEngineWarning = newWarning
+            statusBarController.syncEngineSelectionDisplay()
+        }
+
+        // メニューバーの「音声認識エンジン」サブメニューでSpeechAnalyzerストリーミング項目を
+        // disabled表示にするかどうかの判定。判定ロジックは設定画面(`TranscriptionSettingsView`)と
+        // 共通の`StreamingTranscriptionAvailability.currentStatus()`をそのまま再利用する
+        // (macOSバージョン+ja-JPロケール対応の非同期照会を含むため、起動をブロックしないよう
+        // ここでも`Task`で行う)。
+        Task { @MainActor [weak statusBarController] in
+            let status = await StreamingTranscriptionAvailability.currentStatus()
+            statusBarController?.updateSpeechAnalyzerAvailability(status)
         }
 
         let accessibilityWarning = "アクセシビリティ権限が未許可のため、カーソル位置へのテキスト挿入ができません。システム設定 > プライバシーとセキュリティ > アクセシビリティ で許可してください。"
@@ -185,6 +262,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // (誤ってスタブへ流れダミーテキストが挿入されるのを防ぐため、拒否のみでフォールバックはしない)。
         coordinator.onRecordingRejectedDuringSetup = { [weak statusHUDController] in
             statusHUDController?.reportRecordingRejectedDuringSetup()
+        }
+
+        // 実機バグ再発防止: sttEngine==speechAnalyzerが選択されているのに、この録音では
+        // (何らかの理由で)ストリーミングセッションを生成できず、whisper.cppへ黙って
+        // フォールバックしてしまうことを防ぐための可視化。5秒間フェードする軽い警告として表示する
+        // (`onFormattingFailed`と同じ方針: 致命的ではなく、この録音はwhisperで処理されるため)。
+        coordinator.onStreamingUnavailableFallback = { [weak statusBarController] message in
+            statusBarController?.addWarning(message)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak statusBarController] in
+                statusBarController?.removeWarning(message)
+            }
         }
 
         // VAD(Voice Activity Detection)モデルが未配置ならバックグラウンドで自動ダウンロードする

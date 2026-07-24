@@ -66,4 +66,31 @@ struct DictationJob: Sendable {
     /// 録音開始時点のフロントモストアプリ(挿入時のフォーカス一致比較・挿入先の想定に使う)。
     let frontmostAppAtRecordingStart: NSRunningApplication?
     let settings: DictationJobSettingsSnapshot
+    /// SpeechAnalyzerストリーミングモードで録音した場合、録音開始時に生成されたセッション。
+    /// `nil`ならwhisper.cpp(バッチ)モード(従来通り`samples`を`TranscriptionEngine.transcribe`へ渡す)。
+    /// 非nilの場合、`Coordinator.runJob`はwhisper.cppを一切呼ばず、このセッションの`finish()`が返す
+    /// 確定テキストをそのまま(仕様通り)後段のLLM整形→辞書置換→挿入へ渡す。
+    var streamingSession: StreamingTranscriptionSession? = nil
+    /// `streamingSession`が非nilの場合、そのセッション生成時に発行されたライブプレビュー世代ID
+    /// (`Coordinator.streamingPreviewGeneration`)。`Coordinator.runJob`が処理完了時にこの世代が
+    /// まだ最新(=この録音の後により新しい録音が始まっていない)かどうかを判定し、最新であれば
+    /// ライブプレビューを隠す(`onStreamingPreviewHide`)。既に追い越されている場合は、既に次の
+    /// 録音がプレビューパネルを使用中の可能性があるため、隠す呼び出しをスキップする
+    /// (詳細はCoordinator.runJob冒頭のコメント参照)。
+    var streamingPreviewGeneration: Int? = nil
+    /// `streamingSession`が`nil`(バッチ/whisper.cppモード)の場合に実際に使う`TranscriptionEngine`。
+    /// 録音開始時点で`TranscriptionEngineSnapshotProviding`経由(`DynamicTranscriptionEngine`が
+    /// 準拠)に捕捉した「その時点で実際に使われていた実エンジン」そのものへの参照であり、
+    /// `Coordinator`が保持する共有の`DynamicTranscriptionEngine`(設定変更のたびに`reload()`で
+    /// 内部エンジンが差し替わりうる)とは別に、このジョブ専用に固定する。
+    ///
+    /// バグ修正: これを導入する前は`Coordinator.runJob`が共有の`transcriptionEngine`を直接呼んで
+    /// いたため、whisper.cppで録音され待ち行列中(このプロパティで言えばそのジョブ用に捕捉された
+    /// 実エンジンがwhisper.cppを指している状態)のジョブが、ユーザーが設定画面/メニューバーで
+    /// SpeechAnalyzerへ切り替えた(`DynamicTranscriptionEngine.reload()`が呼ばれ、内部エンジンが
+    /// プレースホルダーの`StubTranscriptionEngine`に差し替わる)時点以降に処理されると、実質
+    /// スタブ(ダミーテキスト)で処理されてしまっていた。録音開始時点で実エンジンの参照を
+    /// 固定して持ち回ることで、待ち行列中のエンジン切替の影響を受けないようにする
+    /// (`streamingSession`が非nilの場合はこのプロパティは使われない)。
+    let batchTranscriptionEngine: TranscriptionEngine
 }

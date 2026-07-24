@@ -22,7 +22,14 @@ final class SettingsWindowController: NSWindowController {
 
         let window = NSWindow(contentViewController: hosting)
         window.title = "Voicewriter 設定"
-        window.styleMask = [.titled, .closable, .miniaturizable]
+        // .resizableを付けないと、タブ切替でコンテンツがウィンドウ高さを超えた際に
+        // ユーザー側で広げる手段が無くなり、上下が見切れたまま固定されてしまう
+        // (実際に発生した不具合: 音声認識タブでラジオボタン群やVADセクションが見切れる)。
+        window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
+        // タブ内のコンテンツをこれ以上小さくすると、ScrollViewで包んでいても
+        // ラベルや長いパス表示が窮屈になるための下限。
+        window.minSize = NSSize(width: 560, height: 480)
+        window.setContentSize(NSSize(width: 560, height: 560))
         // ウィンドウを閉じても破棄せず、次回「設定...」選択時に同じインスタンスを再表示する。
         window.isReleasedWhenClosed = false
         window.center()

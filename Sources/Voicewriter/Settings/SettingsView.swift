@@ -31,6 +31,9 @@ struct SettingsView: View {
             GeneralSettingsView()
                 .tabItem { Label("一般", systemImage: "gearshape") }
         }
-        .frame(width: 520, height: 420)
+        // 固定サイズ(旧: 520x420)だと、タブごとに内容量が違う・将来増える場合に
+        // 上下端からコンテンツがはみ出して見切れる(各タブ側はScrollViewで包んで対応)。
+        // ウィンドウ側を.resizableにした上で、ここは初期表示に十分な最小/推奨サイズだけ指定する。
+        .frame(minWidth: 560, idealWidth: 560, minHeight: 480, idealHeight: 560)
     }
 }

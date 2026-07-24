@@ -9,6 +9,8 @@ struct GeneralSettingsView: View {
     @AppStorage(SettingsKey.soundEffectsEnabled) private var soundEffectsEnabled: Bool = true
 
     var body: some View {
+        // ウィンドウ高さより内容が長くなった場合でも見切れないよう、タブ内をScrollViewで包む。
+        ScrollView {
         Form {
             Section {
                 Toggle("ログイン時に起動", isOn: $launchAtLoginEnabled)
@@ -48,5 +50,6 @@ struct GeneralSettingsView: View {
             }
         }
         .padding()
+        }
     }
 }

@@ -50,6 +50,13 @@ final class AudioCaptureEngine: AudioCaptureEngineControlling {
     /// `controlQueue`からの読み取りに追加の同期は設けていない。
     var onLevelUpdate: ((Float) -> Void)?
 
+    /// 録音中、変換済み(16kHz/mono/Float32)の音声チャンクを`recordingBuffer`への蓄積と並行して
+    /// 通知する(SpeechAnalyzerストリーミングモードでの逐次認識へのfan-out用)。`controlQueue`上で
+    /// 同期的に呼ばれる(=呼び出し先はブロッキングしない同期関数であること)。ストリーミングモードを
+    /// 使わない場合は`Coordinator`側が何もしないハンドラのままにしておいてよい(既存のwhisperモードの
+    /// 挙動には一切影響しない、純粋な追加のfan-outポイント)。
+    var onRecordingChunk: (([Float], Double) -> Void)?
+
     private let log = Logger(subsystem: "dev.voicewriter.app", category: "AudioCaptureEngine")
 
     private let engine = AVAudioEngine()
@@ -227,6 +234,13 @@ final class AudioCaptureEngine: AudioCaptureEngineControlling {
             let preroll = ringBuffer.recent(seconds: Settings.prerollSeconds, sampleRate: Self.targetSampleRate)
             recordingBuffer = preroll
             isRecording = true
+            // Codexレビュー指摘#3: プリロールは`recordingBuffer`(whisperモードが最後にまとめて使う経路)
+            // には含まれていたが、`onRecordingChunk`(SpeechAnalyzerストリーミングモードへのfan-out)には
+            // 一度も流れておらず、ストリーミングモードだけ発話冒頭の音声を取りこぼしていた。
+            // whisper経路と同じ音声がストリーミング側にも届くよう、ここで明示的に1回fan-outする。
+            if !preroll.isEmpty {
+                onRecordingChunk?(preroll, Self.targetSampleRate)
+            }
             log.info("Recording started (alwaysOn), preroll samples=\(preroll.count)")
 
         case .onDemand:
@@ -384,6 +398,7 @@ final class AudioCaptureEngine: AudioCaptureEngineControlling {
 
         guard isRecording else { return }
         recordingBuffer.append(contentsOf: samples)
+        onRecordingChunk?(samples, Self.targetSampleRate)
 
         if let onLevelUpdate {
             let rms = Self.computeRMS(samples)

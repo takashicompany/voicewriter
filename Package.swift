@@ -8,7 +8,8 @@ let package = Package(
     ],
     products: [
         .executable(name: "Voicewriter", targets: ["Voicewriter"]),
-        .executable(name: "verify-whisper", targets: ["VerifyWhisper"])
+        .executable(name: "verify-whisper", targets: ["VerifyWhisper"]),
+        .executable(name: "verify-speech-analyzer", targets: ["VerifySpeechAnalyzer"])
     ],
     dependencies: [
         .package(url: "https://github.com/sindresorhus/KeyboardShortcuts", from: "2.2.0")
@@ -39,6 +40,14 @@ let package = Package(
                 "whisper"
             ],
             path: "Sources/VerifyWhisper"
+        ),
+        // Apple SpeechAnalyzer/SpeechTranscriber(macOS 26+)統合の検証用スタンドアロンCLI。
+        // 使い方: swift run verify-speech-analyzer <wav-path> [locale-identifier]
+        // macOS 26未満のビルド環境でもコンパイルできるよう、API呼び出しはすべて
+        // #available(macOS 26, *)でガードしている(Package全体の最低ターゲットはmacOS 14のまま)。
+        .executableTarget(
+            name: "VerifySpeechAnalyzer",
+            path: "Sources/VerifySpeechAnalyzer"
         ),
         // Codexレビューで指摘された競合修正(リングバッファのロック境界、入力フォーマット検証、
         // ModelDownloaderの状態遷移)の回帰テスト。AVAudioEngine自体はハードウェア依存のため対象外。

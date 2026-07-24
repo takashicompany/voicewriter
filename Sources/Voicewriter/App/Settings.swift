@@ -14,6 +14,11 @@ enum SttEngineKind: String, CaseIterable {
     case whisperCpp
     /// ダミーテキストを返すスタブ
     case stub
+    /// Apple SpeechAnalyzer/SpeechTranscriber(macOS 26+)によるストリーミング入力。
+    /// 確定(final)テキストのみを使い(whisperは通さない)、その後段のLLM整形→辞書置換→挿入は
+    /// 既存パイプラインをそのまま通す。macOS 26未満、またはSpeechTranscriberがja非対応の環境では
+    /// 選択不可(設定UIでグレーアウト)。
+    case speechAnalyzer
 }
 
 /// UserDefaultsを介した設定値。すべてデフォルト値を持ち、未設定でも安全に動作する。
@@ -33,6 +38,7 @@ enum SettingsKey {
     static let formattingTimeoutSeconds = "formattingTimeoutSeconds"
     static let hudEnabled = "hudEnabled"
     static let soundEffectsEnabled = "soundEffectsEnabled"
+    static let streamingPreviewEnabled = "streamingPreviewEnabled"
 }
 
 enum Settings {
@@ -233,6 +239,20 @@ enum Settings {
         }
         set {
             UserDefaults.standard.set(newValue, forKey: SettingsKey.soundEffectsEnabled)
+        }
+    }
+
+    /// SpeechAnalyzerストリーミングモードでの録音中、確定/未確定(volatile)テキストのライブプレビューを
+    /// 別フローティングパネルに表示するかどうか。既定ON。既存の状態表示HUD(`hudEnabled`)とは独立。
+    static var streamingPreviewEnabled: Bool {
+        get {
+            if UserDefaults.standard.object(forKey: SettingsKey.streamingPreviewEnabled) == nil {
+                return true
+            }
+            return UserDefaults.standard.bool(forKey: SettingsKey.streamingPreviewEnabled)
+        }
+        set {
+            UserDefaults.standard.set(newValue, forKey: SettingsKey.streamingPreviewEnabled)
         }
     }
 }

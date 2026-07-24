@@ -316,13 +316,28 @@ tccutil reset Microphone dev.voicewriter.app
 
 `./scripts/create-signing-identity.sh` で導入した安定署名を使っている場合、この許可は再ビルドをまたいで維持されるため、**上記の許可作業は(証明書導入後は)基本的に1回だけ**で済みます。アドホック署名に戻した場合や、証明書を作り直した場合は、再度 `tccutil reset Accessibility dev.voicewriter.app` の上で許可し直してください。
 
+## メニューバー
+
+`StatusBarController`(`Sources/Voicewriter/App/StatusBarController.swift`)が管理するメニュー構成(上から順):
+
+- 状態表示(待機中/録音中/文字起こし中、常に無効化されたラベル表示)
+- LLM整形の状態表示(Ollama未検出時のみ表示)
+- **音声認識エンジン**(サブメニュー): 「Whisper(一括)」「SpeechAnalyzer(ストリーミング)」の2択。現在選択中の方にチェックマークを表示する。stub(ダミーテキスト、デバッグ用)はここには出さず、設定画面(下記「設定画面」の「音声認識」タブ)からのみ選択できる。
+  - SpeechAnalyzerがこの環境で利用不可(macOS 26未満、または日本語(ja-JP)のSpeechTranscriberが非対応)の場合は選択不可(disabled)にし、ツールチップとタイトル併記(「- 利用不可」)で理由を示す。可否判定は設定画面のPickerと同じ`StreamingTranscriptionAvailability.currentStatus()`をそのまま再利用しており、判定ロジックの二重実装はしていない。
+  - 切替は`Settings.sttEngine`への書き込み+`DynamicTranscriptionEngine.reload()`という、設定画面のPickerの`onChange`と全く同じ経路を通るため即時反映される(設定画面を開いていれば`@AppStorage`経由でPicker側の表示も自動的に追随する)。
+  - 録音中・処理中にメニューから切り替えても、既に録音を開始しているジョブの挙動は変わらない(設定画面から切り替えた場合と同じ挙動)。エンジン種別(whisper.cpp/SpeechAnalyzer)は録音開始時点(`Coordinator.attemptStartRecording`)で確定し、SpeechAnalyzerストリーミングセッションを使うかどうかも録音開始時に決まる。それ以外の設定(言語・語彙ヒント・VAD・整形設定・辞書)も含め、各ジョブは`DictationJobSettingsSnapshot`として録音開始時点の値をスナップショットして処理するため、待ち行列中の設定変更は既に録音済みのジョブには影響しない。
+- 設定...(⌘,、設定ウィンドウを開く)
+- 最近の文字起こし結果(直近5件の履歴からの手動コピー)
+- すべての処理をキャンセル
+- 終了
+
 ## 設定画面
 
 メニューバーの「設定...」(⌘,)からSwiftUI製の設定ウィンドウを開けます。このアプリは`LSUIElement=true`(Dockアイコン無し)のため、ウィンドウを開くたびに`NSApp.activate` + `makeKeyAndOrderFront`で明示的に前面化しています(`Sources/Voicewriter/App/SettingsWindowController.swift`)。6つのタブで構成されます(`Sources/Voicewriter/Settings/`)。
 
 - **マイク**: マイクモード(常時オープン/必要時のみ)の切替、プリロール秒数(0〜2秒、常時オープン時のみ有効)、リングバッファ秒数、マイクをオフにするまでの秒数(2〜30秒、必要時のみモード時のみ有効)のスライダー。マイクモードとリングバッファ秒数の変更は`AudioCaptureEngine`へ即座に反映されます(常時オープンへの切替はAVAudioEngineを起動、必要時のみへの切替は録音中でなければ即座にエンジンを停止)。
 - **ショートカット**: `KeyboardShortcuts.Recorder`でPush-to-Talk/トグル/キャンセルの割当を変更できます。変更はライブラリ側が自動的に永続化・グローバル監視へ反映します。
-- **音声認識**: エンジン(whisper.cpp/スタブ)と言語(`ja`/`auto`)の選択、認識のヒント(`initial_prompt`用の語彙ヒント、カンマ区切り)、モデルファイルの状態表示(配置済みならパスとサイズ、未配置なら通常は初回起動時に自動でダウンロードが進行中のはずだが、失敗した場合のためのダウンロードボタンで進捗付きダウンロードを実行可能)。エンジン/言語の変更は次回の文字起こしから反映されます(`Sources/Voicewriter/Transcription/DynamicTranscriptionEngine.swift`が内部エンジンを差し替える)。ヒントの変更はエンジン再ロード不要で次回の文字起こしから反映されます。
+- **音声認識**: エンジン(whisper.cpp/スタブ)と言語(`ja`/`auto`)の選択、認識のヒント(`initial_prompt`用の語彙ヒント、カンマ区切り)、モデルファイルの状態表示(配置済みならパスとサイズ、未配置なら通常は初回起動時に自動でダウンロードが進行中のはずだが、失敗した場合のためのダウンロードボタンで進捗付きダウンロードを実行可能)。エンジン/言語の変更は次回の文字起こしから反映されます(`Sources/Voicewriter/Transcription/DynamicTranscriptionEngine.swift`が内部エンジンを差し替える)。ヒントの変更はエンジン再ロード不要で次回の文字起こしから反映されます。whisper.cpp/SpeechAnalyzerの2択は、この設定画面を開かなくてもメニューバーの「音声認識エンジン」サブメニューから同じ経路で切り替えられます(詳細は上記「メニューバー」参照。stubはデバッグ用のためメニューバーには出さず、この設定画面のみで選択可能)。
 - **整形**: LLM整形(下記「LLM整形パス」参照)のON/OFF、Ollamaモデル選択(`/api/tags`から動的取得)、タイムアウト秒数、Ollama未導入の場合の案内文(公式URL付き)。
 - **辞書**: ユーザー定義の置換ルール(下記「ユーザー辞書(置換)」参照)の一覧編集。有効/無効の切替、置換元/置換先の編集、行の追加・削除・並べ替え(ドラッグ)、`dictionary.json`をFinderで表示するボタン。編集はキー入力のたびに即座に保存されます。
 - **一般**: ログイン時に起動するかどうかを`SMAppService.mainApp`(macOS 13+)で登録/解除します。加えて、状態表示HUD・効果音のON/OFF(下記「状態表示HUDと効果音」参照、いずれも既定ON)。
@@ -626,7 +641,7 @@ Sources/Voicewriter/
     DictationJob.swift              1発話分のジョブモデル・設定スナップショット・終端状態
     DictationJobRegistry.swift      ジョブごとの状態(未終端/終端)・キャンセルフラグの一元管理
     DeliveryCoordinator.swift       発話順(sequence順)を厳守するテキスト挿入のリオーダーバッファ
-    StatusBarController.swift       メニューバーUI(状態表示・文字起こし結果の履歴・すべてキャンセル)
+    StatusBarController.swift       メニューバーUI(状態表示・音声認識エンジン切替・文字起こし結果の履歴・すべてキャンセル)
     Settings.swift
     SettingsWindowController.swift  設定ウィンドウの生成・前面化(LSUIElement対応)
     LaunchAtLogin.swift             SMAppServiceによるログイン時起動の登録/解除
@@ -1036,6 +1051,52 @@ whisper.cpp v1.9.1の`whisper.h`には、セグメント単位のno_speech確率
   - 実際にホットキーを一瞬だけ押してすぐ離した場合(第1層)、実際に無音の部屋でホットキーを押した場合(第2層)に、それぞれ`whisper_full`が呼ばれず、HUDに「短すぎるためキャンセル」「無音のためキャンセル」が表示されること。
   - VADモデルの初回自動ダウンロード(`VadModelAutoProvisioner`)が、実際にネットワーク接続がある初回起動時にバックグラウンドで成功し、ログ(`VAD model auto-downloaded and installed at ...`)が出ること。オフライン環境や既存モデル配置済み環境での挙動(ダウンロードをスキップ/失敗を無視して起動を継続すること)も未確認です。
   - 実マイクでの息継ぎ・小声の相槌など、エネルギーゲート(第2層)の閾値(`globalRmsThreshold=0.003`, `maxFrameRmsThreshold=0.006`)が実際のマイク環境のノイズフロアと比べて適切かどうか(閾値が厳しすぎて小声発話を誤って棄却しないか、緩すぎて環境ノイズのみの録音を通してしまわないか)は、合成フィクスチャでの確認に留まっており実機での様子見が必要です。
+
+### SpeechAnalyzerストリーミングのライブプレビュー(`.fastResults`)とプレビュー用/確定用の2モジュール化
+
+発話中にライブプレビューが一切表示されず、キーを離した後にまとめて表示される実機バグを調査した結果、
+`SpeechTranscriberFactory`の`reportingOptions`が`[.volatileResults]`のみだったことが原因と判明した。
+この検証環境(macOS 26.4.1)では`.volatileResults`単独だと録音中に`.update`が一切発行されず、
+`.fastResults`を追加することで録音中も継続的に届くようになった。
+
+その後のA/B比較(`scripts/fixtures/*.wav`、`.fastResults`あり/なしで最終(isFinal)テキストを比較)で、
+9本中7本は完全一致、1本は句読点のみの軽微な差だったが、1本(`sample-ja-fast-16k.wav`、早口フィクスチャ)
+では最終テキストの末尾が数文字欠落する再現性のある差異が出ることが判明した。つまり`.fastResults`の
+精度への影響はvolatile(暫定表示)に留まらず、最終確定テキスト(実際に挿入されるテキスト)にも及びうる。
+
+この対策として、プレビュー表示専用(`.fastResults`あり)と確定テキスト専用(`.fastResults`なし、
+`reportingOptions: []`)の2つの`SpeechTranscriber`モジュールへ役割分担した(詳細・実測は
+`SpeechTranscriberFactory`/`SpeechAnalyzerEngine`のドキュメントコメント参照)。
+
+- **採用構成: 2つの独立した`SpeechAnalyzer`(1アナライザー1モジュールを2組、音声はfan-out)**。
+  Appleの`SpeechAnalyzer.volatileRange`ドキュメントは2モジュールを同一`SpeechAnalyzer`に同居させる
+  構成を示唆しており、APIも`SpeechAnalyzer(modules: [any SpeechModule])`で複数モジュールを受け付ける。
+  しかし実機検証の結果、**この端末では確定用モジュール(`.fastResults`なし)を同一アナライザーに
+  同居させるだけで、プレビュー用モジュール側の逐次配信までもが録音終了後のバースト配信に劣化し、
+  ライブプレビューが一切表示されない元の実機バグが再発する**ことを確認した
+  (`SpeechAnalyzerEngineIntegrationTests.testVolatileUpdateArrivesWhileStillFeedingBeforeFinishIsCalled`)。
+  そのため単一アナライザー2モジュール構成は採用せず、各モジュールを独立した`SpeechAnalyzer`に載せ、
+  変換済みの音声バッファを複製して両方へfan-outする構成にした。
+- **確定用モジュールの`reportingOptions`**: `[]`(空集合)。`isFinal`な結果のみを消費する用途のため
+  `.volatileResults`も不要と判断し、`finish()`が返す最終テキストはこちらの`results`からのみ集計する。
+- **リソース概況**(`testResourceComparisonBetweenTwoModuleAndFinalOnlyConfigurations`、
+  `sample-ja-10s-16k.wav`使用、同一プロセス内の壁時計時間・常駐メモリ増分の概況値):
+  1アナライザー(確定用のみ)で約0.16〜0.17秒、2アナライザー(プレビュー+確定)で約0.23〜0.25秒
+  (増分はおおむね1.5倍程度)。常駐メモリの増分は数十KB程度でノイズと大差ない範囲だった。
+  実行環境依存で数値は変動するため目安として扱うこと。
+- **設定連動**: `Settings.streamingPreviewEnabled`(設定画面の「録音中にライブプレビューを表示する」)
+  がOFFの場合、プレビュー用モジュール/アナライザー自体を生成せず確定用のみの1アナライザー構成に
+  フォールバックし、CPU/メモリ負荷をさらに抑える。既定はON(2アナライザー)。
+- **既知の制約(残存する軽微な非決定性)**: 2アナライザーを並走させること自体が(`.fastResults`の
+  有無とは別に)確定テキストの句読点選択(「、」/「。」)にごく稀に影響することを実機で確認した
+  (`sample-ja-10s-16k.wav`: 1アナライザーのみでは常に「ですね、」、プレビュー用アナライザー並走時は
+  「ですね。」になる)。文字の欠落・誤認識ではなく句読点選択のみの差であり、
+  `testAllFixturesFinalTextHaveNoRegressionBetweenTwoModuleAndFinalOnlyConfigurations`では
+  この差異を許容した上で内容の回帰がないことを確認している。
+- 実機での対話的な確認(合成キーイベント+スピーカー再生によるPTT録音)では、`recordingState=recording`の
+  ログが録音中継続的に出ることを確認済み(`Coordinator.handleStreamingEvent`の診断ログ参照)。この確認は
+  2モジュール化以前に行ったものであり、2モジュール化後の実機での対話的な再確認(実際のキー操作)は
+  未実施(自動テストでの確認のみ)。
 
 ### 連続音声入力パイプラインの実機確認
 

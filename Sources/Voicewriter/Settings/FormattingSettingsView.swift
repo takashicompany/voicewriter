@@ -9,6 +9,8 @@ struct FormattingSettingsView: View {
     @AppStorage(SettingsKey.formattingTimeoutSeconds) private var formattingTimeoutSeconds: Double = 10.0
 
     var body: some View {
+        // ウィンドウ高さより内容が長くなった場合でも見切れないよう、タブ内をScrollViewで包む。
+        ScrollView {
         Form {
             Section {
                 Toggle("音声認識後にLLMで整形する", isOn: $formattingEnabled)
@@ -54,6 +56,7 @@ struct FormattingSettingsView: View {
         .onAppear {
             modelLister.refresh()
         }
+        }
     }
 
     @ViewBuilder
@@ -97,8 +100,14 @@ struct FormattingSettingsView: View {
                     .font(.footnote)
                     .foregroundStyle(.red)
                     .fixedSize(horizontal: false, vertical: true)
-                TextField("モデル名(例: qwen3:14b)", text: $formattingModel)
-                    .textFieldStyle(.roundedBorder)
+                // 語彙ヒント欄と同様、TextField(_:text:)の第1引数をForm内でそのまま使うと
+                // 暗黙のラベル列としても描画され値と紛らわしくなるため、
+                // ラベル無し(`prompt:` + `.labelsHidden()`)の初期化子を使う。
+                TextField(text: $formattingModel, prompt: Text("モデル名(例: qwen3:14b)")) {
+                    Text("モデル名")
+                }
+                .labelsHidden()
+                .textFieldStyle(.roundedBorder)
                 Button("再取得") {
                     modelLister.refresh()
                 }
