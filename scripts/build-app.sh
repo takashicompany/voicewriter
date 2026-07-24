@@ -46,7 +46,13 @@ if [[ -d "$ROOT_DIR/Resources/MenuBarIcon" ]]; then
   cp "$ROOT_DIR/Resources/MenuBarIcon/"*.png "$RESOURCES_DIR/MenuBarIcon/"
 fi
 
-# KeyboardShortcutsのリソースバンドル(ローカライズ文字列等)が生成されていればコピーする
+# KeyboardShortcutsのリソースバンドル(ローカライズ文字列等)が生成されていればコピーする。
+# Contents/Resources/への配置が正規の配置場所(vendor/KeyboardShortcutsのUtilities.swiftが
+# ここを最優先で探す。2026-07-24: 配布先で「設定→ショートカット」タブを開くとクラッシュする
+# 不具合の原因調査・修正の詳細はそちらのコメント参照。かつてはここに.appバンドル直下への
+# コピーも追加しようとしたが、macOSの.appはContents/配下のみが正規の内容物であり、
+# `codesign`が直下(Contents外)の内容物を「unsealed contents present in the bundle root」
+# として署名を拒否するため断念した)。
 if [[ -d "$BIN_PATH/KeyboardShortcuts_KeyboardShortcuts.bundle" ]]; then
   cp -R "$BIN_PATH/KeyboardShortcuts_KeyboardShortcuts.bundle" "$RESOURCES_DIR/"
 fi

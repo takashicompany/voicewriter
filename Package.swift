@@ -12,7 +12,12 @@ let package = Package(
         .executable(name: "verify-speech-analyzer", targets: ["VerifySpeechAnalyzer"])
     ],
     dependencies: [
-        .package(url: "https://github.com/sindresorhus/KeyboardShortcuts", from: "2.2.0")
+        // 2026-07-24: リモート版(2.4.0, revision 1aef855)をvendor/KeyboardShortcutsへ取り込み、
+        // ローカルpathパッケージに切り替えた。「設定→ショートカット」タブを開くと配布先で
+        // クラッシュする不具合(Bundle.moduleの解決失敗によるfatalError)を修正するための
+        // 最小パッチをUtilities.swiftに当てている。詳細はvendor/KeyboardShortcuts/Sources/
+        // KeyboardShortcuts/Utilities.swiftのコメント参照。
+        .package(path: "vendor/KeyboardShortcuts")
     ],
     targets: [
         .binaryTarget(
