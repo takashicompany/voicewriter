@@ -122,6 +122,9 @@ final class Coordinator: AudioCaptureEngineDelegate {
     var onQueueFull: (() -> Void)?
     /// 録音を継続できない致命的なエラーが起きた際に呼ばれる(メニューバー警告用)。
     var onFatalAudioError: ((String) -> Void)?
+    /// `onFatalAudioError`で出した警告から自動復旧した際に、通知済みメッセージごとに呼ばれる
+    /// (メニューバー警告の取り下げ用)。
+    var onFatalAudioErrorRecovered: ((String) -> Void)?
     /// LLM整形が失敗し、原文へフォールバックした際に呼ばれる(メニューバーの軽い警告用)。
     var onFormattingFailed: ((String) -> Void)?
     /// `.transcribing`中の内部フェーズが変わるたびに呼ばれる(HUDの「認識中/整形中」表示切替用)。
@@ -203,6 +206,9 @@ final class Coordinator: AudioCaptureEngineDelegate {
     /// 「現在の録音のジョブID」が録音中から存在するようになり、Escの階層的キャンセル(後述)や
     /// キュー上限判定が録音中の枠も正しく数えられる。
     private var currentRecordingSequence: Int?
+    /// `onFatalAudioError`でメニューバー警告として出したメッセージ。オーディオデバイスの
+    /// 障害から自動復旧できたときに、同じメッセージで取り下げるために保持する。
+    private var reportedFatalAudioErrorMessages: Set<String> = []
     /// `.finalizing`中(録音停止済みグレー待ち)にホットキーで新規録音が要求された場合、
     /// ここに保留し、グレースが明けた直後(`finalizeRecordingTransition()`)に自動的に開始する。
     private var pendingStartRequest: ActivationSource?
@@ -745,7 +751,21 @@ final class Coordinator: AudioCaptureEngineDelegate {
                     deliveryCoordinator.complete(sequence: sequence, outcome: .tombstone(.failed), frontmostAppAtRecordingStart: frontmostAppAtRecordingStart)
                 }
             }
+            reportedFatalAudioErrorMessages.insert(message)
             onFatalAudioError?(message)
+        }
+    }
+
+    /// オーディオデバイスの障害から自動復旧した。出していた警告をすべて取り下げる。
+    nonisolated func audioCaptureEngineDidRecoverFromFatalError(_ engine: AudioCaptureEngineControlling) {
+        Task { @MainActor in
+            guard !reportedFatalAudioErrorMessages.isEmpty else { return }
+            log.info("Audio engine recovered; clearing audio warnings")
+            let messages = reportedFatalAudioErrorMessages
+            reportedFatalAudioErrorMessages.removeAll()
+            for message in messages {
+                onFatalAudioErrorRecovered?(message)
+            }
         }
     }
 

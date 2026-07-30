@@ -237,6 +237,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusBarController?.addWarning(message)
         }
 
+        // オーディオデバイスの構成変更(Bluetoothヘッドセットの接続など)による一時的な障害から
+        // 自動復旧できた場合は、出していた警告を取り下げる。
+        coordinator.onFatalAudioErrorRecovered = { [weak statusBarController] message in
+            statusBarController?.removeWarning(message)
+        }
+
         // LLM整形の失敗(タイムアウト・整形結果不正等、Ollama未検出以外)は致命的ではない
         // (原文へフォールバック済み)ため、一定時間で自動的に消える軽い警告として表示する
         // (挿入先フォーカス変化時の警告と同じ方針)。

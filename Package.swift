@@ -24,10 +24,19 @@ let package = Package(
             name: "whisper",
             path: "vendor/whisper.xcframework"
         ),
+        // SwiftからはObjCの`NSException`をcatchできないため、`@try/@catch`だけを担う極小の
+        // ObjCターゲット。AVFoundationが事前条件違反でraiseする例外(`installTapOnBus`の
+        // `format.sampleRate == inputHWFormat.sampleRate`など)を捕まえてアプリのabortを防ぐ。
+        .target(
+            name: "VoicewriterObjC",
+            path: "Sources/VoicewriterObjC",
+            publicHeadersPath: "include"
+        ),
         .executableTarget(
             name: "Voicewriter",
             dependencies: [
                 "KeyboardShortcuts",
+                "VoicewriterObjC",
                 "whisper"
             ],
             path: "Sources/Voicewriter",
@@ -58,7 +67,7 @@ let package = Package(
         // ModelDownloaderの状態遷移)の回帰テスト。AVAudioEngine自体はハードウェア依存のため対象外。
         .testTarget(
             name: "VoicewriterTests",
-            dependencies: ["Voicewriter"],
+            dependencies: ["Voicewriter", "VoicewriterObjC"],
             path: "Tests/VoicewriterTests"
         )
     ]
