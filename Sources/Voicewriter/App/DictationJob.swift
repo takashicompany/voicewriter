@@ -71,13 +71,6 @@ struct DictationJob: Sendable {
     /// 非nilの場合、`Coordinator.runJob`はwhisper.cppを一切呼ばず、このセッションの`finish()`が返す
     /// 確定テキストをそのまま(仕様通り)後段のLLM整形→辞書置換→挿入へ渡す。
     var streamingSession: StreamingTranscriptionSession? = nil
-    /// `streamingSession`が非nilの場合、そのセッション生成時に発行されたライブプレビュー世代ID
-    /// (`Coordinator.streamingPreviewGeneration`)。`Coordinator.runJob`が処理完了時にこの世代が
-    /// まだ最新(=この録音の後により新しい録音が始まっていない)かどうかを判定し、最新であれば
-    /// ライブプレビューを隠す(`onStreamingPreviewHide`)。既に追い越されている場合は、既に次の
-    /// 録音がプレビューパネルを使用中の可能性があるため、隠す呼び出しをスキップする
-    /// (詳細はCoordinator.runJob冒頭のコメント参照)。
-    var streamingPreviewGeneration: Int? = nil
     /// `streamingSession`が`nil`(バッチ/whisper.cppモード)の場合に実際に使う`TranscriptionEngine`。
     /// 録音開始時点で`TranscriptionEngineSnapshotProviding`経由(`DynamicTranscriptionEngine`が
     /// 準拠)に捕捉した「その時点で実際に使われていた実エンジン」そのものへの参照であり、

@@ -27,9 +27,10 @@ struct StatusHUDContentView: View {
         .padding(.horizontal, 14)
         .frame(width: Self.panelSize.width, height: Self.panelSize.height)
         .background(
+            // ストリーミングプレビューと同じ「黒70%(透明30%)」。マテリアルは実質不透明に
+            // 描画されるため使わない(StreamingPreviewContentView側のコメント参照)。
             Capsule()
-                .fill(.ultraThinMaterial)
-                .environment(\.colorScheme, .dark)
+                .fill(Color.black.opacity(0.7))
         )
         .overlay(
             Capsule().stroke(Color.white.opacity(0.08), lineWidth: 0.5)

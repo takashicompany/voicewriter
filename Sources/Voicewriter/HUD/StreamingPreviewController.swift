@@ -21,6 +21,10 @@ final class StreamingPreviewController {
 
     private var latestPending: (finalizedText: String, volatileText: String)?
     private var throttleWorkItem: DispatchWorkItem?
+    /// 録音終了後、ジョブが終端(挿入完了/フォーカス不一致/失敗/キャンセル/スキップ)するまでの間true。
+    /// この間もプレビューは消さず、直前の認識テキストの上に「変換中…」を重ねて表示し続ける。
+    /// `hide()`(=ジョブ終端、または新しい録音の開始)でfalseへ戻す。
+    private var isProcessing = false
 
     init() {
         let size = StreamingPreviewContentView.panelSize
@@ -40,6 +44,21 @@ final class StreamingPreviewController {
         scheduleThrottleWindow()
     }
 
+    /// `Coordinator.onStreamingPreviewProcessing`から呼ぶ(キーを離して録音が終わり、確定〜LLM整形〜
+    /// 挿入の後処理に入った)。プレビューは消さず、直前の認識テキストをそのまま残したまま
+    /// 「変換中…」インジケーターを重ねる。録音終了直後にSpeechAnalyzerのfinalizeバーストで
+    /// 追加の`update`が届いた場合も、この処理中フラグは維持される(`update`は本文だけを更新する)。
+    ///
+    /// まだ一度も表示するテキストが無い場合(=このセッションで認識イベントが一切届かなかった)は、
+    /// 空のパネルを新たに出しても情報量が無いため何もしない(状態表示HUD側が「認識中…/整形中…」を
+    /// 既に表示している)。
+    func showProcessing() {
+        guard Settings.streamingPreviewEnabled else { return }
+        isProcessing = true
+        guard latestPending != nil else { return }
+        applyLatestAndShow()
+    }
+
     /// `Coordinator.onStreamingModelPreparing`から呼ぶ(モデル資産の初回自動ダウンロード中)。
     /// スロットル/切り詰め対象の通常テキスト表示とは別扱いで、即座に反映する。
     func showPreparing(progress: Double?) {
@@ -47,15 +66,20 @@ final class StreamingPreviewController {
         throttleWorkItem?.cancel()
         throttleWorkItem = nil
         latestPending = nil
+        isProcessing = false
         viewModel.display = .preparing(progress: progress)
         show()
     }
 
-    /// `Coordinator.onStreamingPreviewHide`から呼ぶ(録音終了/キャンセル/致命的エラー時)。
+    /// `Coordinator.onStreamingPreviewHide`から呼ぶ。呼ばれるのは
+    /// 「ジョブの終端(挿入完了/フォーカス不一致/失敗/キャンセル/スキップ)」「新しい録音の開始」
+    /// 「録音中のキャンセル/致命的エラー」のいずれか。挿入完了時は状態表示HUDの
+    /// 「✓ 挿入しました」と二重にならないよう、静かにフェードアウトするだけにする。
     func hide() {
         throttleWorkItem?.cancel()
         throttleWorkItem = nil
         latestPending = nil
+        isProcessing = false
         NSAnimationContext.runAnimationGroup({ context in
             context.duration = 0.15
             panel.animator().alphaValue = 0
@@ -89,7 +113,11 @@ final class StreamingPreviewController {
             volatileText: pending.volatileText,
             maxCharacters: Self.maxVisibleCharacters
         )
-        viewModel.display = .visible(finalizedText: visibleFinalized, volatileText: visibleVolatile)
+        viewModel.display = .visible(
+            finalizedText: visibleFinalized,
+            volatileText: visibleVolatile,
+            isProcessing: isProcessing
+        )
         show()
     }
 

@@ -153,6 +153,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         coordinator.onStreamingPreviewHide = { [weak streamingPreviewController] in
             streamingPreviewController?.hide()
         }
+        coordinator.onStreamingPreviewProcessing = { [weak streamingPreviewController] in
+            streamingPreviewController?.showProcessing()
+        }
         coordinator.onStreamingModelPreparing = { [weak streamingPreviewController] progress in
             streamingPreviewController?.showPreparing(progress: progress)
         }

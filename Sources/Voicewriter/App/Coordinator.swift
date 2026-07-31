@@ -140,8 +140,16 @@ final class Coordinator: AudioCaptureEngineDelegate {
     /// 更新されるたびに呼ばれる(ライブプレビューパネル表示用)。挿入先アプリへは一切流し込まない
     /// (仕様: volatileテキストは挿入しない。確定時に従来通り1回だけ挿入する)。
     var onStreamingPreviewUpdate: ((_ finalizedText: String, _ volatileText: String) -> Void)?
-    /// ストリーミングのライブプレビューを隠すべきタイミング(録音終了/キャンセル/致命的エラー)で呼ばれる。
+    /// ストリーミングのライブプレビューを隠すべきタイミングで呼ばれる。呼ばれるのは
+    /// 「そのジョブの終端(挿入完了/フォーカス不一致/失敗/キャンセル/スキップ)」「新しい録音の開始」
+    /// 「録音中のキャンセル/致命的エラー」のいずれか。**キーを離した時点(録音終了)では呼ばれない**
+    /// (仕様変更: 整形〜挿入までの数秒間もプレビューを残すため。録音終了時は代わりに
+    /// `onStreamingPreviewProcessing`を呼ぶ)。
     var onStreamingPreviewHide: (() -> Void)?
+    /// ストリーミング録音が終了し、確定〜LLM整形〜挿入の後処理に入ったときに呼ばれる。
+    /// プレビューは消さず、直前の認識テキストを表示したまま「変換中…」を重ねるための通知。
+    /// バッチ(whisper.cpp)モードの録音では呼ばれない(そもそもプレビューを出していないため)。
+    var onStreamingPreviewProcessing: (() -> Void)?
     /// SpeechAnalyzerストリーミングモードで、モデル資産(言語モデル)が未インストールのため
     /// 初回自動ダウンロード中であることの通知。`progress`は0.0〜1.0(不明ならnil)。
     var onStreamingModelPreparing: ((Double?) -> Void)?
@@ -221,7 +229,7 @@ final class Coordinator: AudioCaptureEngineDelegate {
     /// `currentStreamingSession`のスレッドセーフな複製(詳細は`StreamingSessionBox`参照)。
     private let streamingSessionBox = StreamingSessionBox()
     /// 現在録音中(または録音停止グレー中)のセッションに対応するライブプレビュー世代ID。
-    /// `didFinishRecording`で`DictationJob.streamingPreviewGeneration`へ切り出す
+    /// `didFinishRecording`で`streamingPreviewGenerationBySequence`へ移し替える
     /// (`pendingBatchTranscriptionEngine`と同じスナップショットの考え方)。
     private var pendingStreamingPreviewGeneration: Int?
     /// ライブプレビューイベントの世代カウンタ。セッションが切り替わる(または終了する)たびに
@@ -229,6 +237,15 @@ final class Coordinator: AudioCaptureEngineDelegate {
     /// 遅延イベント)を破棄する(Codexレビュー指摘#6: セッションN終了後の遅延イベントが
     /// パネルを再表示したり、既にN+1が始まっている表示を上書きしてしまいうった)。
     private let streamingPreviewGeneration = GenerationCounter()
+    /// ライブプレビューを表示したまま処理中(録音終了済み・未終端)のジョブの、sequence → 世代IDの対応。
+    /// `didFinishRecording`でストリーミングジョブを切り出すたびに登録し、そのジョブが
+    /// `DeliveryCoordinator`で終端(挿入完了/フォーカス不一致/失敗/キャンセル/スキップ)した時点で
+    /// 取り出して、その世代がまだ最新であればプレビューを隠す。
+    ///
+    /// 「ジョブの終端」で隠すのがポイント: 実際のテキスト挿入は`DeliveryCoordinator`が非同期に
+    /// (しかもsequence順が揃うまで待ってから)行うため、`runJob`の終了時点(認識・整形の完了時点)で
+    /// 隠してしまうと、挿入が終わる前にプレビューが消えてしまう。
+    private var streamingPreviewGenerationBySequence: [Int: Int] = [:]
     /// PTT(Push-to-Talk)キーが現在押されているか。`beginPushToTalk()`でtrueに、
     /// `endPushToTalk()`でfalseにする。`finalizing`中の保留や挿入クリティカル区間待機など、
     /// 非同期の`await`を挟んでから実際に録音を開始する経路で、開始直前にキーが既に
@@ -276,6 +293,10 @@ final class Coordinator: AudioCaptureEngineDelegate {
         self.audioEngine.delegate = self
         self.deliveryCoordinator.onCommitted = { [weak self] sequence, result in
             guard let self else { return }
+            // ジョブの終端(=挿入まで完了、またはフォーカス不一致/失敗/キャンセル/スキップで確定)
+            // をもって、そのジョブのライブプレビューを隠す。挿入完了時は状態表示HUDの
+            // 「✓ 挿入しました」と二重にならないよう、プレビュー側は静かにフェードアウトするだけ。
+            self.hideStreamingPreviewIfStillOwned(by: sequence)
             self.recomputeState()
             self.onPendingJobCountChanged?(self.jobRegistry.activeCount)
             self.onJobCommitted?(sequence, result)
@@ -485,6 +506,16 @@ final class Coordinator: AudioCaptureEngineDelegate {
         }
     }
 
+    /// ジョブが終端した際に、そのジョブのライブプレビューを隠す。既に次の録音が始まっていて
+    /// 世代が追い越されている場合は、その新しい録音自身のプレビューを誤って隠してしまわないよう
+    /// 何もしない(連続入力時は「録音中の新しいプレビュー」が優先で、前ジョブの『変換中』表示は
+    /// 新しい録音の開始時点で既に置き換わっている)。
+    private func hideStreamingPreviewIfStillOwned(by sequence: Int) {
+        guard let generation = streamingPreviewGenerationBySequence.removeValue(forKey: sequence) else { return }
+        guard streamingPreviewGeneration.isCurrent(generation) else { return }
+        onStreamingPreviewHide?()
+    }
+
     /// 現在のストリーミングセッションを即座にキャンセルし、後始末する(誰も`finish()`を呼ばない
     /// 経路(Escキャンセル等)で、バックグラウンドの購読Task/AsyncStreamが残り続けないようにするため)。
     /// 世代も同時に進め、このセッションからの遅延イベント(Escキャンセル直後にまだ飛んでくる
@@ -494,6 +525,10 @@ final class Coordinator: AudioCaptureEngineDelegate {
         session.cancel()
         currentStreamingSession = nil
         streamingSessionBox.set(nil)
+        // 明示的にキャンセルした以上、この録音のプレビューは以後一切表示しない。世代スナップショットも
+        // ここで破棄する(そうしないと、`.finalizing`中のEscキャンセルのように、この後で
+        // `didFinishRecording`が届く経路で「変換中」表示へ入り直してしまう)。
+        pendingStreamingPreviewGeneration = nil
         streamingPreviewGeneration.next()
         onStreamingPreviewHide?()
     }
@@ -679,13 +714,20 @@ final class Coordinator: AudioCaptureEngineDelegate {
             // (世代が新しい録音開始時点で既に進んでいるため)引き続き防止されたまま、
             // 「録音停止後にまとめて届く正当な結果まで握りつぶす」という副作用だけを取り除く。
             //
-            // ここでの`onStreamingPreviewHide?()`自体は残す(「録音が終わった」ことを視覚的に
-            // 即座に伝えるため、一旦フェードアウトする)。世代を進めていないため、直後に
-            // finalize中の結果が`onStreamingPreviewUpdate`で届けば`StreamingPreviewController.update`
-            // が再度パネルを表示する(`update`は`show()`を呼ぶため、`hide()`直後でも問題なく
-            // 再表示できる)。最終的な非表示は、`runJob`が`finish()`の解決を検知した時点
-            // (下記`defer`)で確実に行う。
-            onStreamingPreviewHide?()
+            // 仕様変更(生成中もプレビューを残す): 以前はここで`onStreamingPreviewHide?()`を呼び、
+            // キーを離した瞬間に一旦フェードアウトさせていた。ライブ表示が正常化した現在は
+            // キーを離した後に新しい認識イベントがほとんど届かないため、整形〜挿入までの数秒間
+            // プレビューが消えたままになってしまっていた。そのため録音終了時点では隠さず、
+            // 直前の認識テキストを表示したまま「変換中…」を重ねる(`onStreamingPreviewProcessing`)。
+            // 実際に隠すのはこのジョブが`DeliveryCoordinator`で終端した時点
+            // (`hideStreamingPreviewIfStillOwned(by:)`)。バッチ(whisper.cpp)モードでは
+            // プレビュー自体を出していないため、従来通り隠す呼び出しのみを行う(実質no-op)。
+            if let streamingPreviewGenerationForJob {
+                streamingPreviewGenerationBySequence[sequence] = streamingPreviewGenerationForJob
+                onStreamingPreviewProcessing?()
+            } else {
+                onStreamingPreviewHide?()
+            }
 
             let job = DictationJob(
                 sequence: sequence,
@@ -695,7 +737,6 @@ final class Coordinator: AudioCaptureEngineDelegate {
                 frontmostAppAtRecordingStart: frontmostAppAtRecordingStart,
                 settings: settingsSnapshot,
                 streamingSession: streamingSession,
-                streamingPreviewGeneration: streamingPreviewGenerationForJob,
                 batchTranscriptionEngine: batchTranscriptionEngine
             )
 
@@ -797,18 +838,12 @@ final class Coordinator: AudioCaptureEngineDelegate {
             deliveryCoordinator.complete(sequence: job.sequence, outcome: outcome, frontmostAppAtRecordingStart: job.frontmostAppAtRecordingStart)
         }
 
-        // 実機バグ修正: ストリーミングジョブの場合、この関数を抜ける経路(キャンセル/短すぎる/無音/
-        // 正常終了/失敗のいずれでも)で、まだ最新世代であれば(=この録音の後により新しい録音が
-        // 始まっていなければ)ライブプレビューを隠す。`didFinishRecording`は録音停止と同時に
-        // 世代を進めなくなった(下記`SpeechAnalyzerSession`のコメント参照)ため、`finish()`の
-        // finalizeバーストで届く結果が表示され続けた後、この`defer`が最終的な非表示を担う。
-        // 世代が既に追い越されている(次の録音が既に始まっている)場合は、その録音自身のプレビューを
-        // 誤って隠してしまわないよう何もしない。
-        defer {
-            if let generation = job.streamingPreviewGeneration, streamingPreviewGeneration.isCurrent(generation) {
-                onStreamingPreviewHide?()
-            }
-        }
+        // 注意: ライブプレビューの非表示はこの関数の終了時点(認識・整形の完了時点)では**行わない**。
+        // 実際のテキスト挿入は`DeliveryCoordinator`が非同期に(しかもsequence順が揃うまで待ってから)
+        // 行うため、ここで隠すと挿入が終わる前にプレビューが消えてしまう。非表示はジョブの終端
+        // (`DeliveryCoordinator.onCommitted`)で`hideStreamingPreviewIfStillOwned(by:)`が担う。
+        // この関数の早期return(キャンセル/短すぎる/無音)も`complete(...)`経由で必ず終端するため、
+        // すべての経路が同じ出口を通る。
 
         // Codexレビュー指摘#1(ブロッキング): ストリーミングセッションを持つジョブが、この関数の
         // 早期return(キャンセル済み/短すぎる/無音)で`streamingSession.finish()`を一度も呼ばずに
